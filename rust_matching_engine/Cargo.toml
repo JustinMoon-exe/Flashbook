@@ -1,6 +1,26 @@
+# rust_matching_engine/Cargo.toml
 [package]
 name = "rust_matching_engine"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[bin]]
+name = "engine_subscriber"
+path = "src/bin/subscriber.rs"
 
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rust_decimal = { version = "1.35", features = ["serde", "serde-with-str"] }
+rust_decimal_macros = "1.35"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+redis = { version = "0.25", features = ["tokio-comp"] }
+log = "0.4"
+env_logger = "0.11"
+thiserror = "1.0"
+futures-util = "0.3"
+
+[dev-dependencies]
+# Add development-only dependencies here if needed later
