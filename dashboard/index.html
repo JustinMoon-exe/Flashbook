@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flashbook Dashboard</title>
+    <style>
+        /* --- Basic Layout & Theme --- */
+        body { font-family: sans-serif; margin: 15px; background-color: #f8f9fa; color: #333; font-size: 14px; }
+        h1 { text-align: center; color: #0056b3; margin-bottom: 20px; }
+        h3, h4, h5 { color: #004085; margin-bottom: 10px; }
+        section { margin-bottom: 25px; border: 1px solid #ced4da; border-radius: 8px; padding: 20px; background-color: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        button { padding: 4px 10px; font-size: 0.9em; cursor: pointer; margin-left: 5px; border: 1px solid #ccc; border-radius: 4px; background-color: #e9ecef;}
+        button:hover { background-color: #d6d8db; }
+        input[type="number"] { width: 60px; padding: 3px 5px; font-size: 0.9em; border: 1px solid #ccc; border-radius: 3px;}
+
+        /* --- Status --- */
+        #status { margin-bottom: 20px; font-style: italic; font-weight: bold; padding: 10px; border-radius: 5px; display: block; text-align: center; width: fit-content; margin-left: auto; margin-right: auto;}
+        #status.connected { color: #155724; background-color: #d4edda; border: 1px solid #c3e6cb;}
+        #status.disconnected { color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb;}
+        #status.connecting { color: #004085; background-color: #cce5ff; border: 1px solid #b8daff;}
+
+        /* --- Global Controls --- */
+        .global-controls { text-align: center; margin-bottom: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; }
+        .global-controls button { padding: 8px 15px; margin: 0 10px; font-size: 1em; background-color: #007bff; color: white; border-color: #007bff; }
+        .global-controls button:hover { background-color: #0056b3; border-color: #0056b3; }
+        #reset-button { background-color: #dc3545; border-color: #dc3545; }
+        #reset-button:hover { background-color: #c82333; border-color: #bd2130; }
+
+        /* --- Paused Overlay --- */
+        .paused-overlay { display: none; /* Hidden by default */ position: fixed; /* Sit on top of the page content */ width: 100%; height: 100%; top: 0; left: 0; right: 0; bottom: 0; background-color: rgba(0,0,0,0.7); /* Black background with opacity */ z-index: 1000; /* Specify a stack order */ cursor: pointer; /* Add a pointer on hover */ color: white; font-size: 3em; text-align: center; padding-top: 40vh; font-weight: bold; }
+        body.is-paused .paused-overlay { display: block; /* Show when body has class */ }
+
+        /* --- Market Data Sections --- */
+        .market-data-container { display: flex; flex-wrap: wrap; justify-content: center; gap: 25px; }
+        .market-symbol-section { width: 46%; min-width: 420px; }
+        .market-symbol-section h3 { font-size: 1.4em; text-align: center; border-bottom: 1px solid #eee; padding-bottom: 8px; margin-bottom: 15px;}
+        .bbo-section { margin-bottom: 15px; padding: 10px; background-color: #fdfdfe; border-radius: 5px; border: 1px dashed #eee;}
+        .bbo-section h4 { font-size: 1.1em; margin-top: 0; margin-bottom: 8px; text-align: center;}
+        .price { font-weight: bold; }
+        .qty { color: #555; margin-left: 5px;}
+        .timestamp { font-size: 0.8em; color: #6c757d; margin-top: 10px; text-align: center; }
+
+        /* Order Book Styles */
+        .book-container { display: flex; justify-content: center; gap: 10px; }
+        .book-column { padding: 8px 10px; width: 48%; background-color: #fdfdff; border-radius: 5px; border: 1px solid #eee;}
+        .book-column h5 { font-size: 1em; margin-top: 0; margin-bottom: 5px; text-align: center; border-bottom: 1px solid #eee; padding-bottom: 5px;}
+        .book-level { display: flex; justify-content: space-between; padding: 3px 2px; font-size: 0.9em; border-bottom: 1px dotted #eee;}
+        .book-level:last-child { border-bottom: none; }
+        .book-bids .book-price { color: #155724; }
+        .book-asks .book-price { color: #721c24; }
+        .book-price { font-weight: bold; flex-basis: 48%; text-align: right; padding-right: 5px; }
+        .book-qty { color: #555; flex-basis: 48%; text-align: left; padding-left: 5px; }
+        .book-placeholder { color:#888; padding: 10px 0; text-align: center; font-style: italic;}
+
+        /* Agent Control Styles */
+        .agents-section { max-width: 90%; margin-left: auto; margin-right: auto;}
+        .agents-section h3 { margin-top: 0; text-align: center; border-bottom: 1px solid #eee; padding-bottom: 10px;}
+        .agent-list { list-style: none; padding: 0; max-height: 350px; /* Slightly taller */ overflow-y: auto; }
+        .agent-item { display: grid; grid-template-columns: 1fr auto; gap: 15px; align-items: center; padding: 10px 5px; border-bottom: 1px solid #eee; }
+        .agent-item:last-child { border-bottom: none; }
+        .agent-info { display: flex; flex-direction: column; gap: 4px; }
+        .agent-info-basic { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;}
+        .agent-info-stats { display: flex; gap: 10px; font-size: 0.85em; color: #444; margin-top: 5px; flex-wrap: wrap;}
+        .agent-info-stats > span { margin-right: 5px; }
+        .agent-id { font-weight: bold; min-width: 100px; font-size: 0.95em;}
+        .agent-symbol { color: #0056b3; font-weight: bold; font-size: 0.95em;}
+        .agent-strategy-select { font-size: 0.85em; padding: 3px 4px; border-radius: 4px; border: 1px solid #ccc; }
+        .agent-status { font-style: italic; font-weight: bold; padding: 3px 8px; border-radius: 4px; font-size: 0.85em; }
+        .agent-status.active { color: #155724; background-color: #d4edda; }
+        .agent-status.inactive { color: #721c24; background-color: #f8d7da; }
+        .agent-pnl, .agent-unrealized-pnl { font-weight: bold; }
+        .agent-pnl.positive, .agent-unrealized-pnl.positive { color: green; }
+        .agent-pnl.negative, .agent-unrealized-pnl.negative { color: red; }
+        .agent-controls { display: flex; flex-direction: column; gap: 5px; align-items: flex-end;}
+        .agent-controls .control-group { display: flex; gap: 5px; align-items: center;}
+
+        /* Exchange Stats */
+        .exchange-stats { text-align: center; font-size: 1.1em;}
+        .exchange-stats span { font-weight: bold; margin-left: 8px; color: #0056b3;}
+
+        /* Trades Table */
+        .trades-container { max-width: 90%; margin-left: auto; margin-right: auto; }
+        #trades-table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+        #trades-table th, #trades-table td { border: 1px solid #ddd; padding: 4px 6px; text-align: right; }
+        #trades-table th { background-color: #e9ecef; text-align: center; }
+        #trades-table td:nth-child(2) { text-align: center; } /* Symbol */
+        #trades-table td:nth-child(5) { text-align: left; font-family: monospace; font-size: 0.9em; } /* Trade ID */
+    </style>
+</head>
+<body>
+    <div class="paused-overlay" id="paused-overlay">PAUSED</div>
+
+    <h1>Flashbook Real-Time Dashboard</h1>
+    <div id="status" class="connecting">Connecting...</div>
+
+    <section class="global-controls">
+        <button id="pause-resume-button">Pause</button>
+        <button id="reset-button">Reset Market</button>
+    </section>
+
+    <section class="exchange-stats">
+        Total Trades: <span id="total-trades">0</span> |
+        Total Value Traded: $<span id="total-value">0.00</span> |
+        Last Update: <span id="stats-timestamp">---</span>
+    </section>
+
+    <section class="market-data-container">
+        <!-- Section for ABC Symbol -->
+        <div class="market-symbol-section" id="market-ABC">
+             <h3>ABC Market</h3>
+            <div class="bbo-section">
+                <h4>Best Bid/Offer</h4>
+                <div>Bid: <span id="bbo-bid-price-ABC" class="price">---</span> @ <span id="bbo-bid-qty-ABC" class="qty">---</span></div>
+                <div>Ask: <span id="bbo-ask-price-ABC" class="price">---</span> @ <span id="bbo-ask-qty-ABC" class="qty">---</span></div>
+                <div class="timestamp">Last BBO Update: <span id="bbo-timestamp-ABC">---</span></div>
+            </div>
+            <div class="book-container">
+                <div class="book-column book-asks"><h5>Asks (Top 5)</h5><div id="asks-display-ABC"><div class="book-placeholder">Waiting...</div></div></div>
+                <div class="book-column book-bids"><h5>Bids (Top 5)</h5><div id="bids-display-ABC"><div class="book-placeholder">Waiting...</div></div></div>
+            </div>
+        </div>
+        <!-- Section for XYZ Symbol -->
+        <div class="market-symbol-section" id="market-XYZ">
+             <h3>XYZ Market</h3>
+            <div class="bbo-section">
+                 <h4>Best Bid/Offer</h4>
+                <div>Bid: <span id="bbo-bid-price-XYZ" class="price">---</span> @ <span id="bbo-bid-qty-XYZ" class="qty">---</span></div>
+                <div>Ask: <span id="bbo-ask-price-XYZ" class="price">---</span> @ <span id="bbo-ask-qty-XYZ" class="qty">---</span></div>
+                <div class="timestamp">Last BBO Update: <span id="bbo-timestamp-XYZ">---</span></div>
+            </div>
+            <div class="book-container">
+                <div class="book-column book-asks"><h5>Asks (Top 5)</h5><div id="asks-display-XYZ"><div class="book-placeholder">Waiting...</div></div></div>
+                <div class="book-column book-bids"><h5>Bids (Top 5)</h5><div id="bids-display-XYZ"><div class="book-placeholder">Waiting...</div></div></div>
+            </div>
+        </div>
+    </section>
+
+    <section class="agents-section">
+        <h3>Agent Control</h3>
+        <ul id="agent-list" class="agent-list">
+            <li>Loading agents...</li>
+            <!-- Template Reference:
+            <li class="agent-item" id="agent-AGENT_ID">
+                <div class="agent-info">
+                    <div class="agent-info-basic"> ... </div>
+                    <div class="agent-info-stats">
+                        <span>Bankroll: $<span class="agent-bankroll">...</span></span>
+                        <span>Pos: <span class="agent-position">...</span></span>
+                        <span>Real PnL: $<span class="agent-pnl">...</span></span>
+                        <span>Unreal PnL: $<span class="agent-unrealized-pnl">...</span></span>
+                        <span>Trades: <span class="agent-trade-count">...</span></span>
+                    </div>
+                </div> <div class="agent-controls"> ... </div>
+            </li> -->
+        </ul>
+    </section>
+
+    <section class="trades-container">
+        <h3>Recent Trades (All Symbols)</h3>
+        <table id="trades-table">
+             <thead> <tr> <th>Time</th><th>Symbol</th><th>Price</th><th>Quantity</th><th>Trade ID</th> </tr> </thead>
+            <tbody> <tr><td colspan="5" style="text-align:center; color:#888;">Waiting for trades...</td></tr> </tbody>
+        </table>
+    </section>
+
+    <script src="main.js"></script>
+</body>
+</html>

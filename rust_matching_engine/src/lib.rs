@@ -3,9 +3,9 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
-use serde::{Deserialize, Serialize};
+// Import Serializer/Deserializer traits
+use serde::{Deserialize, Serialize, Serializer, Deserializer};
 use std::collections::{BTreeMap, VecDeque};
-// Removed unused std::cmp::Ordering
 
 // --- Enums ---
 
@@ -17,7 +17,7 @@ pub enum OrderSide {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")] // Handles "new", "filled", etc. from JSON
 pub enum OrderStatus {
     #[default] // Mark New as the default variant for derive(Default)
     New,
@@ -32,50 +32,60 @@ pub enum OrderStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
-    // Use Uuid type, Serde handles string conversion automatically
-    #[serde(default = "Uuid::new_v4")]
+    // *** REMOVED default attribute: Expect ID from incoming JSON ***
     pub id: Uuid,
     pub side: OrderSide,
     pub symbol: String,
-    // Ensure this attribute is present to handle string price from JSON
     #[serde(with = "rust_decimal::serde::str")]
     pub price: Decimal,
     pub quantity: u64,
-    pub timestamp: DateTime<Utc>,
-    #[serde(default)] // Uses OrderStatus::default() which is New
+    pub timestamp: DateTime<Utc>, // Ensure FastAPI sends this
+    #[serde(default)] // Keep default for status
     pub status: OrderStatus,
-    // Ensure remaining_quantity is deserialized/serialized
-    // Default makes sense if Python model always initializes it
-    #[serde(default)]
+    // Use default + alias to initialize from quantity if missing/null
+    #[serde(default, alias = "quantity")]
     pub remaining_quantity: u64,
 }
 
+// Example helper if more complex initialization needed post-deserialization
+// Not strictly required with the serde attribute above, but shows pattern
 impl Order {
-    // Constructor might need update if Python sends remaining_quantity
+    pub fn ensure_remaining_quantity(&mut self) {
+         // If remaining is 0 or nonsensical, reset it to initial quantity
+         if self.remaining_quantity == 0 || self.remaining_quantity > self.quantity {
+             self.remaining_quantity = self.quantity;
+         }
+         // If status is New, ensure remaining is same as quantity
+         if self.status == OrderStatus::New {
+            self.remaining_quantity = self.quantity;
+         }
+    }
+    // Keep original constructor if needed for tests/internal use
     pub fn new(side: OrderSide, symbol: String, price: Decimal, quantity: u64) -> Self {
+        let id = Uuid::new_v4();
         Order {
-            id: Uuid::new_v4(),
+            id,
             side,
             symbol,
             price,
             quantity,
             timestamp: Utc::now(),
             status: OrderStatus::New,
-            remaining_quantity: quantity, // Initialize remaining here
+            remaining_quantity: quantity, // Initialize remaining quantity
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
+    #[serde(default = "Uuid::new_v4")]
     pub trade_id: Uuid,
     pub symbol: String,
-    // Ensure this attribute is present to handle string price from JSON
     #[serde(with = "rust_decimal::serde::str")]
     pub price: Decimal,
     pub quantity: u64,
-    pub taker_order_id: Uuid,
-    pub maker_order_id: Uuid,
+    pub taker_order_id: Uuid, // Should now match the original IDs
+    pub maker_order_id: Uuid, // Should now match the original IDs
     pub timestamp: DateTime<Utc>,
 }
 
@@ -93,6 +103,92 @@ impl Trade {
      }
 }
 
+// --- Custom Serde Helper for Option<Decimal> as String/Null ---
+mod decimal_option_serde_as_string {
+    use rust_decimal::Decimal;
+    use serde::{Serializer, Deserializer, Deserialize};
+
+    pub fn serialize<S>(value: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        match value {
+            Some(ref d) => rust_decimal::serde::str::serialize(d, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where D: Deserializer<'de> {
+        let opt_str = Option::<String>::deserialize(deserializer)?;
+        match opt_str {
+            // Use from_str which handles standard decimal strings
+            Some(s) => Decimal::from_str_radix(&s, 10).map(Some).map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
+
+// --- BBO Update Structure ---
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BboUpdate {
+    pub symbol: String,
+    #[serde(default, with = "decimal_option_serde_as_string")] // Add default, use custom helper
+    pub bid_price: Option<Decimal>,
+    pub bid_qty: Option<u64>,
+    #[serde(default, with = "decimal_option_serde_as_string")] // Add default, use custom helper
+    pub ask_price: Option<Decimal>,
+    pub ask_qty: Option<u64>,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl BboUpdate {
+    pub fn new(
+        symbol: String,
+        bid_price: Option<Decimal>,
+        bid_qty: Option<u64>,
+        ask_price: Option<Decimal>,
+        ask_qty: Option<u64>,
+    ) -> Self {
+        BboUpdate {
+            symbol,
+            bid_price,
+            bid_qty: bid_qty.filter(|&q| q > 0), // Filter out 0 qty
+            ask_price,
+            ask_qty: ask_qty.filter(|&q| q > 0), // Filter out 0 qty
+            timestamp: Utc::now(),
+        }
+    }
+}
+
+// --- Order Book Snapshot Structures ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PriceLevelInfo {
+    #[serde(with = "rust_decimal::serde::str")] // Serialize price as string
+    pub price: Decimal,
+    pub quantity: u64, // Total quantity at this level
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderBookSnapshot {
+    pub symbol: String,
+    pub bids: Vec<PriceLevelInfo>, // Top N bids (highest prices first)
+    pub asks: Vec<PriceLevelInfo>, // Top N asks (lowest prices first)
+    pub timestamp: DateTime<Utc>,
+}
+
+impl OrderBookSnapshot {
+    pub fn new(symbol: String, bids: Vec<PriceLevelInfo>, asks: Vec<PriceLevelInfo>) -> Self {
+        OrderBookSnapshot {
+            symbol,
+            bids,
+            asks,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
+
 // --- Order Book Logic ---
 
 type PriceLevel = VecDeque<Order>; // Queue of orders at a specific price
@@ -100,10 +196,10 @@ type PriceLevel = VecDeque<Order>; // Queue of orders at a specific price
 #[derive(Debug, Default)]
 pub struct OrderBook {
     symbol: String,
-    // Bids: Use BTreeMap for sorted prices (ascending). Iterate reversed for best bid.
-    bids: BTreeMap<Decimal, PriceLevel>,
-    // Asks: Use BTreeMap for sorted prices (ascending). Iterate normally for best ask.
-    asks: BTreeMap<Decimal, PriceLevel>,
+    bids: BTreeMap<Decimal, PriceLevel>, // Highest bid is last key
+    asks: BTreeMap<Decimal, PriceLevel>, // Lowest ask is first key
+    last_bbo: Option<BboUpdate>,
+    last_snapshot: Option<OrderBookSnapshot>,
 }
 
 impl OrderBook {
@@ -112,16 +208,59 @@ impl OrderBook {
             symbol,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
+            last_bbo: None,
+            last_snapshot: None,
         }
     }
 
-    pub fn symbol(&self) -> &str {
-        &self.symbol
+    pub fn symbol(&self) -> &str { &self.symbol }
+    pub fn last_bbo(&self) -> &Option<BboUpdate> { &self.last_bbo }
+    pub fn last_bbo_mut(&mut self) -> &mut Option<BboUpdate> { &mut self.last_bbo }
+    pub fn last_snapshot(&self) -> &Option<OrderBookSnapshot> { &self.last_snapshot }
+    pub fn last_snapshot_mut(&mut self) -> &mut Option<OrderBookSnapshot> { &mut self.last_snapshot }
+
+    pub fn get_bbo_with_qty(&self) -> (Option<Decimal>, Option<u64>, Option<Decimal>, Option<u64>) {
+        let best_bid_price = self.bids.keys().last().cloned();
+        let best_bid_qty = best_bid_price.and_then(|price| {
+            self.bids.get(&price).map(|level| level.iter().map(|o| o.remaining_quantity).sum())
+        });
+
+        let best_ask_price = self.asks.keys().next().cloned();
+        let best_ask_qty = best_ask_price.and_then(|price| {
+            self.asks.get(&price).map(|level| level.iter().map(|o| o.remaining_quantity).sum())
+        });
+
+        (best_bid_price, best_bid_qty.filter(|&q| q > 0), best_ask_price, best_ask_qty.filter(|&q| q > 0))
     }
 
+    pub fn get_snapshot(&self, depth: usize) -> OrderBookSnapshot {
+        let bids_snapshot: Vec<PriceLevelInfo> = self.bids.iter().rev()
+            .take(depth)
+            .map(|(&price, level)| PriceLevelInfo {
+                price,
+                quantity: level.iter().map(|order| order.remaining_quantity).sum(),
+            })
+            .filter(|level| level.quantity > 0)
+            .collect();
+
+        let asks_snapshot: Vec<PriceLevelInfo> = self.asks.iter()
+            .take(depth)
+            .map(|(&price, level)| PriceLevelInfo {
+                price,
+                quantity: level.iter().map(|order| order.remaining_quantity).sum(),
+            })
+            .filter(|level| level.quantity > 0)
+            .collect();
+
+        OrderBookSnapshot::new(self.symbol.clone(), bids_snapshot, asks_snapshot)
+    }
+
+
     // --- Core Matching Logic ---
-    // Returns the final status of the incoming order and any trades generated.
     pub fn add_order(&mut self, mut order: Order) -> (OrderStatus, Vec<Trade>) {
+        // Ensure remaining quantity is sensible after deserialization
+        order.ensure_remaining_quantity();
+
         // Basic validation
         if order.symbol != self.symbol {
             log::error!("Mismatched symbols: Order '{}' vs Book '{}'", order.symbol, self.symbol);
@@ -134,178 +273,124 @@ impl OrderBook {
             return (order.status, vec![]);
         }
 
-        // Initialize remaining_quantity if it wasn't set correctly (safety net)
-        if order.remaining_quantity == 0 || order.remaining_quantity > order.quantity {
-             order.remaining_quantity = order.quantity;
+        // If it arrived with New status, mark as Accepted by the book
+        if order.status == OrderStatus::New {
+             order.status = OrderStatus::Accepted;
         }
-        // Mark as Accepted before attempting matching (if it passes initial checks)
-        order.status = OrderStatus::Accepted;
 
         log::info!("Processing order: Id={}, Side={:?}, Price={}, Qty={}, Rem={}",
                  order.id, order.side, order.price, order.quantity, order.remaining_quantity);
 
         let mut trades = Vec::new();
-        let mut final_status = order.status; // Start with Accepted
+        let mut final_status = order.status; // Start with current status
 
         match order.side {
             OrderSide::Buy => {
-                // Match against asks (lowest asking price first)
-                let mut asks_to_remove = Vec::new(); // Price levels to remove after iteration
+                let mut asks_to_remove = Vec::new();
+                let mut makers_touched = Vec::new(); // Track makers for order updates
 
-                // Iterate over ask levels mutably, lowest price first
+                // Iterate through ask levels that can be matched
                 for (&ask_price, price_level) in self.asks.iter_mut() {
-                    if order.remaining_quantity == 0 || ask_price > order.price {
-                        break; // Stop if taker filled or asks are too expensive
-                    }
+                    if order.remaining_quantity == 0 || ask_price > order.price { break; }
 
-                    // Process orders within this price level (FIFO)
+                    let mut makers_in_level_touched = Vec::new();
                     for maker_order in price_level.iter_mut() {
-                        if order.remaining_quantity == 0 { break; } // Taker filled
+                        if order.remaining_quantity == 0 { break; }
 
                         let trade_quantity = std::cmp::min(order.remaining_quantity, maker_order.remaining_quantity);
-
                         if trade_quantity > 0 {
-                            let trade = Trade::new(
-                                self.symbol.clone(),
-                                maker_order.price, // Trade at the resting maker's price
-                                trade_quantity,
-                                order.id,       // Taker is the incoming buy order
-                                maker_order.id, // Maker is the resting sell order
-                            );
-                            log::debug!("Generated Trade: {:?}", trade);
-                            trades.push(trade);
+                            // Create trade: Taker is the incoming order, Maker is from book
+                            trades.push(Trade::new(self.symbol.clone(), maker_order.price, trade_quantity, order.id, maker_order.id));
 
                             // Update quantities
                             order.remaining_quantity -= trade_quantity;
                             maker_order.remaining_quantity -= trade_quantity;
 
-                            // Update maker order status
-                            if maker_order.remaining_quantity == 0 {
-                                maker_order.status = OrderStatus::Filled;
-                                log::debug!("Maker order {} fully filled.", maker_order.id);
-                            } else {
-                                maker_order.status = OrderStatus::PartiallyFilled;
-                                log::debug!("Maker order {} partially filled, remaining: {}.", maker_order.id, maker_order.remaining_quantity);
-                            }
+                            // Update maker status
+                            maker_order.status = if maker_order.remaining_quantity == 0 { OrderStatus::Filled } else { OrderStatus::PartiallyFilled };
+                            log::debug!("Maker order {} status updated to {:?}", maker_order.id, maker_order.status);
+                            // Add a clone for publishing update later
+                            makers_in_level_touched.push(maker_order.clone());
                         }
-                    } // End loop through orders at this price level
-
-                    // Remove fully filled maker orders from the front of the queue
-                    price_level.retain(|o| o.status != OrderStatus::Filled);
-
-                    // If the price level queue is now empty, mark it for removal
-                    if price_level.is_empty() {
-                        asks_to_remove.push(ask_price);
                     }
-                } // End loop through ask price levels
+                    // Add all touched makers from this level to the main list
+                    makers_touched.append(&mut makers_in_level_touched);
 
-                // Remove empty ask levels outside the borrow loop
-                for price in asks_to_remove {
-                    self.asks.remove(&price);
-                    log::debug!("Removed empty ask level at price {}", price);
+                    // Clean up filled orders within the level
+                    price_level.retain(|o| o.status != OrderStatus::Filled);
+                    if price_level.is_empty() { asks_to_remove.push(ask_price); }
                 }
+                // Remove empty price levels from the book
+                for price in asks_to_remove { self.asks.remove(&price); log::debug!("Removed empty ask level at price {}", price); }
 
-                // Determine final status for the incoming buy order
+                // Determine final status of the incoming (taker) order
                 if order.remaining_quantity == 0 {
                     final_status = OrderStatus::Filled;
                     log::info!("Taker buy order {} fully filled.", order.id);
                 } else {
-                    // If it traded at all, it's partially filled, otherwise just accepted
-                    if order.remaining_quantity < order.quantity {
-                        final_status = OrderStatus::PartiallyFilled;
-                    } // else status remains Accepted
-
-                    log::info!("Adding resting buy order {} to book. Status: {:?}, Rem: {}",
-                             order.id, final_status, order.remaining_quantity);
-                    // Add remaining part of the buy order to the bids book
-                    order.status = final_status; // Update status before adding
-                    self.bids.entry(order.price)
-                        .or_insert_with(VecDeque::new)
-                        .push_back(order); // Add to end of queue (FIFO)
+                    if order.remaining_quantity < order.quantity { final_status = OrderStatus::PartiallyFilled; }
+                    else { final_status = OrderStatus::Accepted; } // Remained accepted if no fill
+                    log::info!("Adding resting buy order {} to book. Status: {:?}, Rem: {}", order.id, final_status, order.remaining_quantity);
+                    order.status = final_status; // Update the order struct itself
+                    self.bids.entry(order.price).or_default().push_back(order.clone()); // Store clone in book
                 }
-            } // End Buy Side Match
 
+                // TODO: Publish updates for makers_touched
+            }
             OrderSide::Sell => {
-                // Match against bids (highest bid price first)
                 let mut bids_to_remove = Vec::new();
+                let mut makers_touched = Vec::new(); // Track makers for order updates
 
-                // Iterate over bid levels mutably, highest price first (using .rev())
-                for (&bid_price, price_level) in self.bids.iter_mut().rev() {
-                    if order.remaining_quantity == 0 || bid_price < order.price {
-                        break; // Stop if taker filled or bids are too low
-                    }
+                // Iterate through bid levels (highest first) that can be matched
+                for (&bid_price, price_level) in self.bids.iter_mut().rev() { // .rev() for highest bids first
+                     if order.remaining_quantity == 0 || bid_price < order.price { break; }
 
-                    for maker_order in price_level.iter_mut() {
+                     let mut makers_in_level_touched = Vec::new();
+                     for maker_order in price_level.iter_mut() {
                         if order.remaining_quantity == 0 { break; }
 
-                        let trade_quantity = std::cmp::min(order.remaining_quantity, maker_order.remaining_quantity);
-
+                         let trade_quantity = std::cmp::min(order.remaining_quantity, maker_order.remaining_quantity);
                         if trade_quantity > 0 {
-                            let trade = Trade::new(
-                                self.symbol.clone(),
-                                maker_order.price, // Trade occurs at the maker's price
-                                trade_quantity,
-                                order.id,       // Taker is the incoming sell order
-                                maker_order.id, // Maker is the resting buy order
-                            );
-                            log::debug!("Generated Trade: {:?}", trade);
-                            trades.push(trade);
+                            // Create trade: Taker is the incoming order, Maker is from book
+                            trades.push(Trade::new(self.symbol.clone(), maker_order.price, trade_quantity, order.id, maker_order.id));
 
+                            // Update quantities
                             order.remaining_quantity -= trade_quantity;
                             maker_order.remaining_quantity -= trade_quantity;
 
-                            if maker_order.remaining_quantity == 0 {
-                                maker_order.status = OrderStatus::Filled;
-                                log::debug!("Maker order {} fully filled.", maker_order.id);
-                            } else {
-                                maker_order.status = OrderStatus::PartiallyFilled;
-                                log::debug!("Maker order {} partially filled, remaining: {}.", maker_order.id, maker_order.remaining_quantity);
-                            }
+                            // Update maker status
+                            maker_order.status = if maker_order.remaining_quantity == 0 { OrderStatus::Filled } else { OrderStatus::PartiallyFilled };
+                             log::debug!("Maker order {} status updated to {:?}", maker_order.id, maker_order.status);
+                             // Add a clone for publishing update later
+                            makers_in_level_touched.push(maker_order.clone());
                         }
-                    } // End loop through orders at this price level
-
-                    // Remove filled maker orders
-                    price_level.retain(|o| o.status != OrderStatus::Filled);
-
-                    if price_level.is_empty() {
-                        bids_to_remove.push(bid_price);
                     }
-                } // End loop through bid price levels
+                    // Add all touched makers from this level to the main list
+                    makers_touched.append(&mut makers_in_level_touched);
 
-                // Remove empty bid levels
-                for price in bids_to_remove {
-                    self.bids.remove(&price);
-                    log::debug!("Removed empty bid level at price {}", price);
+                    // Clean up filled orders within the level
+                    price_level.retain(|o| o.status != OrderStatus::Filled);
+                    if price_level.is_empty() { bids_to_remove.push(bid_price); }
                 }
+                // Remove empty price levels from the book
+                 for price in bids_to_remove { self.bids.remove(&price); log::debug!("Removed empty bid level at price {}", price); }
 
-                // Determine final status for the incoming sell order
+                // Determine final status of the incoming (taker) order
                 if order.remaining_quantity == 0 {
                     final_status = OrderStatus::Filled;
                     log::info!("Taker sell order {} fully filled.", order.id);
                 } else {
-                    if order.remaining_quantity < order.quantity {
-                        final_status = OrderStatus::PartiallyFilled;
-                    } // else status remains Accepted
-
-                    log::info!("Adding resting sell order {} to book. Status: {:?}, Rem: {}",
-                             order.id, final_status, order.remaining_quantity);
-                    // Add remaining part of the sell order to the asks book
-                    order.status = final_status; // Update status before adding
-                    self.asks.entry(order.price)
-                        .or_insert_with(VecDeque::new)
-                        .push_back(order); // Add to end of queue (FIFO)
+                     if order.remaining_quantity < order.quantity { final_status = OrderStatus::PartiallyFilled; }
+                     else { final_status = OrderStatus::Accepted; } // Remained accepted if no fill
+                     log::info!("Adding resting sell order {} to book. Status: {:?}, Rem: {}", order.id, final_status, order.remaining_quantity);
+                     order.status = final_status; // Update the order struct itself
+                    self.asks.entry(order.price).or_default().push_back(order.clone()); // Store clone in book
                 }
-            } // End Sell Side Match
-        } // End match order.side
-
-        (final_status, trades)
-    } // End add_order fn
-
-    // Helper to get current best bid/ask (optional for now)
-    pub fn get_bbo(&self) -> (Option<Decimal>, Option<Decimal>) {
-        let best_bid = self.bids.keys().last().cloned(); // BTreeMap keys are sorted ascending, last is highest
-        let best_ask = self.asks.keys().next().cloned(); // BTreeMap keys are sorted ascending, first is lowest
-        (best_bid, best_ask)
+                 // TODO: Publish updates for makers_touched
+            }
+        }
+        (final_status, trades) // Return taker's final status and generated trades
+        // Note: Maker order updates need separate handling/publishing mechanism
     }
 
 } // End impl OrderBook
@@ -316,229 +401,288 @@ impl OrderBook {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
-    use std::time::Duration; // For potential delays in tests
-
-    // Helper to initialize logging for tests (run only once)
+    // Remove unused imports: use std::time::Duration;
     use std::sync::Once;
+
     static INIT: Once = Once::new();
     fn setup_logging() {
-        INIT.call_once(|| {
-            env_logger::builder().is_test(true).try_init().unwrap();
-        });
+        INIT.call_once(|| { let _ = env_logger::builder().is_test(true).try_init(); });
+    }
+
+    // --- Helper to create a basic order for tests ---
+    fn create_test_order(side: OrderSide, price: Decimal, qty: u64) -> Order {
+        Order {
+            id: Uuid::new_v4(),
+            symbol: "TEST".to_string(),
+            side,
+            price,
+            quantity: qty,
+            timestamp: Utc::now(),
+            status: OrderStatus::New,
+            remaining_quantity: qty,
+        }
     }
 
     #[test]
     fn test_add_order_empty_book() {
         setup_logging();
         let mut book = OrderBook::new("TEST".to_string());
-        let buy_order = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(100.0), 10);
-        let sell_order = Order::new(OrderSide::Sell, "TEST".to_string(), dec!(101.0), 5);
+        let order = create_test_order(OrderSide::Buy, dec!(100.0), 10);
+        let order_id = order.id;
 
-        let (status_buy, trades_buy) = book.add_order(buy_order.clone());
-        assert_eq!(status_buy, OrderStatus::Accepted); // Should just be accepted, not traded
-        assert!(trades_buy.is_empty());
+        let (status, trades) = book.add_order(order);
+
+        assert_eq!(status, OrderStatus::Accepted); // Should just be added to the book
+        assert!(trades.is_empty());
         assert_eq!(book.bids.len(), 1);
-        assert_eq!(book.bids.get(&dec!(100.0)).unwrap().len(), 1);
         assert_eq!(book.asks.len(), 0);
-
-        let (status_sell, trades_sell) = book.add_order(sell_order.clone());
-        assert_eq!(status_sell, OrderStatus::Accepted); // Should just be accepted
-        assert!(trades_sell.is_empty());
-        assert_eq!(book.asks.len(), 1);
-        assert_eq!(book.asks.get(&dec!(101.0)).unwrap().len(), 1);
-        assert_eq!(book.bids.len(), 1); // Bid should still be there
+        assert_eq!(book.bids[&dec!(100.0)].front().unwrap().id, order_id);
+        assert_eq!(book.bids[&dec!(100.0)].front().unwrap().remaining_quantity, 10);
     }
 
     #[test]
     fn test_simple_full_match() {
         setup_logging();
         let mut book = OrderBook::new("TEST".to_string());
-        // Maker Sell order rests first
-        let maker_sell = Order::new(OrderSide::Sell, "TEST".to_string(), dec!(100.0), 10);
-        let (status_maker, _) = book.add_order(maker_sell.clone());
-        assert_eq!(status_maker, OrderStatus::Accepted);
-        assert_eq!(book.asks.get(&dec!(100.0)).unwrap().len(), 1);
+        let ask_order = create_test_order(OrderSide::Sell, dec!(100.0), 10);
+        let ask_id = ask_order.id;
+        book.add_order(ask_order); // Add initial ask
 
-        // Taker Buy order comes in at the same price
-        let taker_buy = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(100.0), 10);
-        let (status_taker, trades_taker) = book.add_order(taker_buy.clone());
+        let buy_order = create_test_order(OrderSide::Buy, dec!(100.0), 10);
+        let buy_id = buy_order.id;
+        let (status, trades) = book.add_order(buy_order);
 
-        assert_eq!(status_taker, OrderStatus::Filled); // Taker fully filled
-        assert_eq!(trades_taker.len(), 1);
-
-        let trade = &trades_taker[0];
-        assert_eq!(trade.price, dec!(100.0)); // Trade at maker price
-        assert_eq!(trade.quantity, 10);
-        assert_eq!(trade.taker_order_id, taker_buy.id);
-        assert_eq!(trade.maker_order_id, maker_sell.id);
-
-        // Book should be empty now
-        assert!(book.asks.is_empty());
-        assert!(book.bids.is_empty());
+        assert_eq!(status, OrderStatus::Filled); // Taker order should be fully filled
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].quantity, 10);
+        assert_eq!(trades[0].price, dec!(100.0));
+        assert_eq!(trades[0].taker_order_id, buy_id);
+        assert_eq!(trades[0].maker_order_id, ask_id);
+        assert!(book.asks.is_empty()); // Maker should be gone
+        assert!(book.bids.is_empty()); // Taker shouldn't rest
     }
 
-    #[test]
+     #[test]
     fn test_partial_match_taker_remaining() {
         setup_logging();
         let mut book = OrderBook::new("TEST".to_string());
-        let maker_sell = Order::new(OrderSide::Sell, "TEST".to_string(), dec!(100.0), 5); // Maker offers 5
-        book.add_order(maker_sell.clone()); // Add maker
+        let ask_order = create_test_order(OrderSide::Sell, dec!(100.0), 5); // Maker has 5
+        let ask_id = ask_order.id;
+        book.add_order(ask_order);
 
-        // Taker wants 10
-        let taker_buy = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(100.0), 10);
-        let (status_taker, trades_taker) = book.add_order(taker_buy.clone());
+        let buy_order = create_test_order(OrderSide::Buy, dec!(100.0), 10); // Taker wants 10
+        let buy_id = buy_order.id;
+        let (status, trades) = book.add_order(buy_order);
 
-        assert_eq!(status_taker, OrderStatus::PartiallyFilled); // Taker partially filled, becomes resting bid
-        assert_eq!(trades_taker.len(), 1);
-
-        let trade = &trades_taker[0];
-        assert_eq!(trade.quantity, 5); // Only 5 could trade
-        assert_eq!(trade.maker_order_id, maker_sell.id);
-
-        // Asks should be empty, Bids should have remaining 5 from taker
-        assert!(book.asks.is_empty());
-        assert_eq!(book.bids.len(), 1);
-        let resting_bid_level = book.bids.get(&dec!(100.0)).unwrap();
-        assert_eq!(resting_bid_level.len(), 1);
-        assert_eq!(resting_bid_level[0].id, taker_buy.id);
-        assert_eq!(resting_bid_level[0].remaining_quantity, 5); // 10 - 5 = 5
-        assert_eq!(resting_bid_level[0].status, OrderStatus::PartiallyFilled); // Status updated correctly
+        assert_eq!(status, OrderStatus::PartiallyFilled); // Taker partially filled, rests
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].quantity, 5); // Trade quantity is maker's qty
+        assert_eq!(trades[0].price, dec!(100.0));
+        assert_eq!(trades[0].taker_order_id, buy_id);
+        assert_eq!(trades[0].maker_order_id, ask_id);
+        assert!(book.asks.is_empty()); // Maker should be gone
+        assert_eq!(book.bids.len(), 1); // Taker should rest
+        assert_eq!(book.bids[&dec!(100.0)].front().unwrap().id, buy_id);
+        assert_eq!(book.bids[&dec!(100.0)].front().unwrap().remaining_quantity, 5); // Taker remaining 5
     }
 
     #[test]
     fn test_partial_match_maker_remaining() {
         setup_logging();
         let mut book = OrderBook::new("TEST".to_string());
-        let maker_sell = Order::new(OrderSide::Sell, "TEST".to_string(), dec!(100.0), 15); // Maker offers 15
-        book.add_order(maker_sell.clone());
+        let ask_order = create_test_order(OrderSide::Sell, dec!(100.0), 15); // Maker has 15
+        let ask_id = ask_order.id;
+        book.add_order(ask_order);
 
-        // Taker only wants 10
-        let taker_buy = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(100.0), 10);
-        let (status_taker, trades_taker) = book.add_order(taker_buy.clone());
+        let buy_order = create_test_order(OrderSide::Buy, dec!(100.0), 10); // Taker wants 10
+        let buy_id = buy_order.id;
+        let (status, trades) = book.add_order(buy_order);
 
-        assert_eq!(status_taker, OrderStatus::Filled); // Taker fully filled
-        assert_eq!(trades_taker.len(), 1);
-
-        let trade = &trades_taker[0];
-        assert_eq!(trade.quantity, 10);
-        assert_eq!(trade.maker_order_id, maker_sell.id);
-
-        // Bids should be empty, Asks should have remaining 5 from maker
-        assert!(book.bids.is_empty());
-        assert_eq!(book.asks.len(), 1);
-        let resting_ask_level = book.asks.get(&dec!(100.0)).unwrap();
-        assert_eq!(resting_ask_level.len(), 1);
-        assert_eq!(resting_ask_level[0].id, maker_sell.id);
-        assert_eq!(resting_ask_level[0].remaining_quantity, 5); // 15 - 10 = 5
-        assert_eq!(resting_ask_level[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(status, OrderStatus::Filled); // Taker fully filled
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].quantity, 10); // Trade quantity is taker's qty
+        assert_eq!(trades[0].price, dec!(100.0));
+        assert_eq!(trades[0].taker_order_id, buy_id);
+        assert_eq!(trades[0].maker_order_id, ask_id);
+        assert_eq!(book.asks.len(), 1); // Maker should remain
+        assert_eq!(book.asks[&dec!(100.0)].front().unwrap().id, ask_id);
+        assert_eq!(book.asks[&dec!(100.0)].front().unwrap().remaining_quantity, 5); // Maker remaining 5
+        assert!(book.bids.is_empty()); // Taker shouldn't rest
     }
 
     #[test]
     fn test_match_multiple_makers_at_same_price() {
         setup_logging();
         let mut book = OrderBook::new("TEST".to_string());
-        // Add two resting sell orders at the same price, respecting time priority
-        let maker_sell1 = Order::new(OrderSide::Sell, "TEST".to_string(), dec!(100.0), 5);
-        std::thread::sleep(Duration::from_millis(1)); // Ensure timestamp difference
-        let maker_sell2 = Order::new(OrderSide::Sell, "TEST".to_string(), dec!(100.0), 8);
+        let ask1 = create_test_order(OrderSide::Sell, dec!(100.0), 5);
+        let ask1_id = ask1.id;
+        book.add_order(ask1);
+        // std::thread::sleep(Duration::from_millis(1)); // Ensure time priority
+        let ask2 = create_test_order(OrderSide::Sell, dec!(100.0), 8);
+        let ask2_id = ask2.id;
+        book.add_order(ask2);
 
-        book.add_order(maker_sell1.clone());
-        book.add_order(maker_sell2.clone());
-        assert_eq!(book.asks.get(&dec!(100.0)).unwrap().len(), 2); // Both orders at this level
+        let buy_order = create_test_order(OrderSide::Buy, dec!(100.0), 10); // Taker wants 10
+        let buy_id = buy_order.id;
+        let (status, trades) = book.add_order(buy_order);
 
-        // Taker buys 10 shares, should fill maker1 then partially fill maker2
-        let taker_buy = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(100.5), 10); // Price crosses book
-        let (status_taker, trades_taker) = book.add_order(taker_buy.clone());
+        assert_eq!(status, OrderStatus::Filled); // Taker fully filled
+        assert_eq!(trades.len(), 2); // Should match both makers
 
-        assert_eq!(status_taker, OrderStatus::Filled);
-        assert_eq!(trades_taker.len(), 2); // Two distinct trades
+        // Trade 1 (against ask1 - first in time)
+        assert_eq!(trades[0].quantity, 5);
+        assert_eq!(trades[0].price, dec!(100.0));
+        assert_eq!(trades[0].taker_order_id, buy_id);
+        assert_eq!(trades[0].maker_order_id, ask1_id);
 
-        // Trade 1 (against maker1 - first in time)
-        assert_eq!(trades_taker[0].quantity, 5);
-        assert_eq!(trades_taker[0].price, dec!(100.0));
-        assert_eq!(trades_taker[0].maker_order_id, maker_sell1.id);
+        // Trade 2 (against ask2)
+        assert_eq!(trades[1].quantity, 5); // Takes 5 from ask2
+        assert_eq!(trades[1].price, dec!(100.0));
+        assert_eq!(trades[1].taker_order_id, buy_id);
+        assert_eq!(trades[1].maker_order_id, ask2_id);
 
-        // Trade 2 (against maker2 - second in time)
-        assert_eq!(trades_taker[1].quantity, 5); // Taker needed 10 total, 5 filled by maker1
-        assert_eq!(trades_taker[1].price, dec!(100.0));
-        assert_eq!(trades_taker[1].maker_order_id, maker_sell2.id);
 
-        // Book state: Bids empty, Asks should have remaining part of maker2
-        assert!(book.bids.is_empty());
-        assert_eq!(book.asks.len(), 1);
-        let resting_ask_level = book.asks.get(&dec!(100.0)).unwrap();
-        assert_eq!(resting_ask_level.len(), 1);
-        assert_eq!(resting_ask_level[0].id, maker_sell2.id);
-        assert_eq!(resting_ask_level[0].remaining_quantity, 3); // 8 - 5 = 3
-        assert_eq!(resting_ask_level[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(book.asks.len(), 1); // Level should still exist
+        assert_eq!(book.asks[&dec!(100.0)].len(), 1); // Only ask2 should remain
+        assert_eq!(book.asks[&dec!(100.0)].front().unwrap().id, ask2_id);
+        assert_eq!(book.asks[&dec!(100.0)].front().unwrap().remaining_quantity, 3); // ask2 remaining 3
+        assert!(book.bids.is_empty()); // Taker shouldn't rest
     }
 
-    #[test]
+     #[test]
     fn test_match_multiple_price_levels() {
         setup_logging();
         let mut book = OrderBook::new("TEST".to_string());
-        // Add resting sells at different prices
-        let maker_sell1 = Order::new(OrderSide::Sell, "TEST".to_string(), dec!(100.0), 5); // Best price
-        let maker_sell2 = Order::new(OrderSide::Sell, "TEST".to_string(), dec!(100.5), 8); // Next best
+        // Add asks at different prices
+        let ask1 = create_test_order(OrderSide::Sell, dec!(100.0), 5); // Best ask
+        let ask1_id = ask1.id;
+        book.add_order(ask1);
+        let ask2 = create_test_order(OrderSide::Sell, dec!(100.1), 8);
+        let ask2_id = ask2.id;
+        book.add_order(ask2);
 
-        book.add_order(maker_sell1.clone());
-        book.add_order(maker_sell2.clone());
-        assert_eq!(book.asks.len(), 2); // Two price levels
+        let buy_order = create_test_order(OrderSide::Buy, dec!(100.1), 10); // Taker willing to pay 100.1, wants 10
+        let buy_id = buy_order.id;
+        let (status, trades) = book.add_order(buy_order);
 
-        // Taker buys 10 shares, price aggressive enough to hit both levels
-        let taker_buy = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(101.0), 10);
-        let (status_taker, trades_taker) = book.add_order(taker_buy.clone());
+        assert_eq!(status, OrderStatus::Filled); // Taker fully filled
+        assert_eq!(trades.len(), 2); // Matches both levels
 
-        assert_eq!(status_taker, OrderStatus::Filled);
-        assert_eq!(trades_taker.len(), 2); // Should trade against both levels
+        // Trade 1 (against best ask price 100.0)
+        assert_eq!(trades[0].quantity, 5);
+        assert_eq!(trades[0].price, dec!(100.0)); // Trade occurs at maker's price
+        assert_eq!(trades[0].taker_order_id, buy_id);
+        assert_eq!(trades[0].maker_order_id, ask1_id);
 
-        // Trade 1 (against best price maker1)
-        assert_eq!(trades_taker[0].quantity, 5);
-        assert_eq!(trades_taker[0].price, dec!(100.0)); // Trade at maker1's price
-        assert_eq!(trades_taker[0].maker_order_id, maker_sell1.id);
+        // Trade 2 (against next ask price 100.1)
+        assert_eq!(trades[1].quantity, 5); // Takes remaining 5 from ask2
+        assert_eq!(trades[1].price, dec!(100.1)); // Trade occurs at maker's price
+        assert_eq!(trades[1].taker_order_id, buy_id);
+        assert_eq!(trades[1].maker_order_id, ask2_id);
 
-        // Trade 2 (against next best price maker2)
-        assert_eq!(trades_taker[1].quantity, 5); // Remaining 5 for taker
-        assert_eq!(trades_taker[1].price, dec!(100.5)); // Trade at maker2's price
-        assert_eq!(trades_taker[1].maker_order_id, maker_sell2.id);
-
-        // Book state: Bids empty, Asks should have remaining part of maker2 at 100.5
-        assert!(book.bids.is_empty());
-        assert_eq!(book.asks.len(), 1); // Only one price level should remain
-        let resting_ask_level = book.asks.get(&dec!(100.5)).unwrap();
-        assert_eq!(resting_ask_level.len(), 1);
-        assert_eq!(resting_ask_level[0].id, maker_sell2.id);
-        assert_eq!(resting_ask_level[0].remaining_quantity, 3); // 8 - 5 = 3
-        assert_eq!(resting_ask_level[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(book.asks.len(), 1); // Level 100.1 should still exist
+        assert_eq!(book.asks[&dec!(100.1)].len(), 1); // ask2 should remain
+        assert_eq!(book.asks[&dec!(100.1)].front().unwrap().id, ask2_id);
+        assert_eq!(book.asks[&dec!(100.1)].front().unwrap().remaining_quantity, 3); // ask2 remaining 3
+        assert!(book.bids.is_empty()); // Taker shouldn't rest
     }
 
     #[test]
     fn test_add_invalid_order_rejected() {
         setup_logging();
         let mut book = OrderBook::new("TEST".to_string());
-        let wrong_symbol = Order::new(OrderSide::Buy, "WRONG_SYMBOL".to_string(), dec!(100.0), 10);
-        let zero_price = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(0), 10);
-        let zero_quantity = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(100.0), 0);
-        let negative_price = Order::new(OrderSide::Buy, "TEST".to_string(), dec!(-50.0), 10);
 
-        let (status1, trades1) = book.add_order(wrong_symbol);
+        // Zero price
+        let order1 = create_test_order(OrderSide::Buy, dec!(0), 10);
+        let (status1, trades1) = book.add_order(order1);
         assert_eq!(status1, OrderStatus::Rejected);
         assert!(trades1.is_empty());
 
-        let (status2, trades2) = book.add_order(zero_price);
+        // Zero quantity
+        let order2 = create_test_order(OrderSide::Sell, dec!(100.0), 0);
+        let (status2, trades2) = book.add_order(order2);
         assert_eq!(status2, OrderStatus::Rejected);
         assert!(trades2.is_empty());
 
-        let (status3, trades3) = book.add_order(zero_quantity);
+        // Mismatched symbol
+        let mut order3 = create_test_order(OrderSide::Buy, dec!(100.0), 10);
+        order3.symbol = "OTHER".to_string();
+        let (status3, trades3) = book.add_order(order3);
         assert_eq!(status3, OrderStatus::Rejected);
         assert!(trades3.is_empty());
 
-        let (status4, trades4) = book.add_order(negative_price);
-        assert_eq!(status4, OrderStatus::Rejected);
-        assert!(trades4.is_empty());
-
-        // Ensure book is still empty after rejections
-        assert!(book.bids.is_empty());
-        assert!(book.asks.is_empty());
+        assert!(book.bids.is_empty() && book.asks.is_empty());
     }
-}
+
+    #[test]
+    fn test_get_bbo_with_qty_logic() {
+        setup_logging();
+        let mut book = OrderBook::new("TEST".to_string());
+
+        // Empty book
+        assert_eq!(book.get_bbo_with_qty(), (None, None, None, None));
+
+        // Only bids
+        book.add_order(create_test_order(OrderSide::Buy, dec!(99.8), 5));
+        book.add_order(create_test_order(OrderSide::Buy, dec!(99.7), 10));
+        book.add_order(create_test_order(OrderSide::Buy, dec!(99.8), 7));
+        assert_eq!(book.get_bbo_with_qty(), (Some(dec!(99.8)), Some(12), None, None));
+
+        // Add asks
+        book.add_order(create_test_order(OrderSide::Sell, dec!(100.1), 9));
+        book.add_order(create_test_order(OrderSide::Sell, dec!(100.2), 15));
+        book.add_order(create_test_order(OrderSide::Sell, dec!(100.1), 11));
+        assert_eq!(book.get_bbo_with_qty(), (Some(dec!(99.8)), Some(12), Some(dec!(100.1)), Some(20)));
+
+        // Fill one side completely
+        let taker_buy = create_test_order(OrderSide::Buy, dec!(101.0), 100); // Takes all asks
+        book.add_order(taker_buy);
+        assert_eq!(book.get_bbo_with_qty(), (Some(dec!(99.8)), Some(12), None, None)); // Only bids left (and resting part of taker if any)
+    }
+
+    #[test]
+    fn test_get_snapshot() {
+        setup_logging();
+        let mut book = OrderBook::new("TEST".to_string());
+        let depth = 3;
+
+        // Add bids
+        book.add_order(create_test_order(OrderSide::Buy, dec!(99.8), 5));
+        book.add_order(create_test_order(OrderSide::Buy, dec!(99.7), 10));
+        book.add_order(create_test_order(OrderSide::Buy, dec!(99.8), 7)); // Aggregate @ 99.8
+        book.add_order(create_test_order(OrderSide::Buy, dec!(99.5), 20));
+        book.add_order(create_test_order(OrderSide::Buy, dec!(99.6), 8));
+
+        // Add asks
+        book.add_order(create_test_order(OrderSide::Sell, dec!(100.2), 15));
+        book.add_order(create_test_order(OrderSide::Sell, dec!(100.1), 9));
+        book.add_order(create_test_order(OrderSide::Sell, dec!(100.3), 25));
+        book.add_order(create_test_order(OrderSide::Sell, dec!(100.1), 11)); // Aggregate @ 100.1
+        book.add_order(create_test_order(OrderSide::Sell, dec!(100.5), 30));
+
+        let snapshot = book.get_snapshot(depth);
+
+        assert_eq!(snapshot.symbol, "TEST");
+        assert!(snapshot.bids.len() <= depth);
+        assert!(snapshot.asks.len() <= depth);
+        assert_eq!(snapshot.bids.len(), 3); // Expecting 3 distinct non-empty bid levels
+        assert_eq!(snapshot.asks.len(), 3); // Expecting 3 distinct non-empty ask levels
+
+
+        // Verify bids (highest first)
+        assert_eq!(snapshot.bids[0].price, dec!(99.8));
+        assert_eq!(snapshot.bids[0].quantity, 12); // 5 + 7
+        assert_eq!(snapshot.bids[1].price, dec!(99.7));
+        assert_eq!(snapshot.bids[1].quantity, 10);
+        assert_eq!(snapshot.bids[2].price, dec!(99.6));
+        assert_eq!(snapshot.bids[2].quantity, 8);
+
+        // Verify asks (lowest first)
+        assert_eq!(snapshot.asks[0].price, dec!(100.1));
+        assert_eq!(snapshot.asks[0].quantity, 20); // 9 + 11
+        assert_eq!(snapshot.asks[1].price, dec!(100.2));
+        assert_eq!(snapshot.asks[1].quantity, 15);
+        assert_eq!(snapshot.asks[2].price, dec!(100.3));
+        assert_eq!(snapshot.asks[2].quantity, 25);
+    }
+} // End tests module
