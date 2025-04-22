@@ -1,276 +1,579 @@
 // dashboard/main.js
 
 // --- Configuration ---
-const WEBSOCKET_URL = "ws://127.0.0.1:8000/api/v1/ws/dashboard";
-const MAX_TRADES_DISPLAY = 30;
-const KNOWN_SYMBOLS = ["ABC", "XYZ"]; // Use updated symbols
-const AVAILABLE_STRATEGIES = ["noise", "market_maker", "momentum"];
+const WEBSOCKET_URL         = "ws://127.0.0.1:8000/api/v1/ws/dashboard";
+const MAX_TRADES_DISPLAY    = 30;
+const KNOWN_SYMBOLS         = ["ABC", "XYZ"];
+const AVAILABLE_STRATEGIES  = ["noise", "market_maker", "momentum"];
+const MAX_CHART_POINTS      = 100;
 
 // --- DOM Elements ---
-const statusDiv = document.getElementById("status");
-const tradesTableBody = document.querySelector("#trades-table tbody");
-const agentListUl = document.getElementById("agent-list");
-const totalTradesSpan = document.getElementById("total-trades");
-const totalValueSpan = document.getElementById("total-value");
-const statsTimestampSpan = document.getElementById("stats-timestamp");
-// --- New Global Control Buttons ---
-const pauseResumeButton = document.getElementById("pause-resume-button");
-const resetButton = document.getElementById("reset-button");
-const pausedOverlay = document.getElementById("paused-overlay");
+const statusDiv            = document.getElementById("status");
+const tradesTableBody      = document.querySelector("#trades-table tbody");
+const agentListUl          = document.getElementById("agent-list");
+const totalTradesSpan      = document.getElementById("total-trades");
+const totalValueSpan       = document.getElementById("total-value");
+const statsTimestampSpan   = document.getElementById("stats-timestamp");
+const pauseResumeButton    = document.getElementById("pause-resume-button");
+const resetButton          = document.getElementById("reset-button");
+const pausedOverlay        = document.getElementById("paused-overlay");
+const eventSymbolInput     = document.getElementById("event-symbol");
+const eventPercentInput    = document.getElementById("event-percent");
+const triggerEventButton   = document.getElementById("trigger-event-button");
 
 // --- Simulation State ---
-let isPaused = false; // Track pause state locally for UI
-
-// --- Agent State Cache ---
-const agentState = {};
+let isPaused       = false;
+const agentState   = {};
+const priceCharts  = {};
+const priceHistory = {};
 
 // --- WebSocket Connection ---
 let ws;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
+let reconnectAttempts         = 0;
+const MAX_RECONNECT_ATTEMPTS  = 5;
 
-function connectWebSocket() { /* ... same as before ... */
-    console.log(`Attempting connect to ${WEBSOCKET_URL} (Attempt ${reconnectAttempts + 1})...`);
-    statusDiv.textContent = "Connecting..."; statusDiv.className = "connecting";
-    ws = new WebSocket(WEBSOCKET_URL);
-    ws.onopen = () => { console.log("WS opened."); statusDiv.textContent = "Connected"; statusDiv.className = "connected"; reconnectAttempts = 0; clearPlaceholders(); populateInitialAgentList(); updatePauseResumeButton(); /* Update button on connect */ };
-    ws.onmessage = (event) => { try { const message = JSON.parse(event.data); handleMessage(message); } catch (error) { console.error("Msg handling error:", error, "Raw data:", event.data); } };
-    ws.onerror = (error) => { console.error("WS error:", error); statusDiv.textContent = "Connection error!"; statusDiv.className = "disconnected"; };
-    ws.onclose = (event) => { console.log("WS closed:", event.code, event.reason); statusDiv.textContent = `Disconnected (${event.code}). ${reconnectAttempts < MAX_RECONNECT_ATTEMPTS ? 'Reconnecting...' : 'Max attempts reached.'}`; statusDiv.className = "disconnected"; if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) { reconnectAttempts++; const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 10000); console.log(`Reconnect in ${delay / 1000}s...`); setTimeout(connectWebSocket, delay); } else { console.error("Max reconnect attempts."); } };
+function connectWebSocket() {
+  console.log(`Connecting (Attempt ${reconnectAttempts + 1})…`);
+  ws = new WebSocket(WEBSOCKET_URL);
+
+  ws.onopen = () => {
+    console.log("WS opened.");
+    statusDiv.textContent  = "Connected";
+    statusDiv.className    = "connected";
+    reconnectAttempts      = 0;
+    clearPlaceholders();
+    initializeCharts();
+    populateInitialAgentList();
+    updatePauseResumeButton();
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      handleMessage(JSON.parse(event.data));
+    } catch (e) {
+      console.error("Msg err:", e, event.data);
+    }
+  };
+
+  ws.onerror = (e) => {
+    console.error("WS err:", e);
+    statusDiv.textContent = "Error!";
+    statusDiv.className   = "disconnected";
+  };
+
+  ws.onclose = (e) => {
+    console.log("WS closed:", e.code);
+    statusDiv.textContent = `Disconnected (${e.code}).`;
+    statusDiv.className   = "disconnected";
+    isPaused             = false;
+    updatePauseResumeButton();
+    destroyCharts();
+
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      const delay = Math.min(1000 * Math.pow(2, reconnectAttempts++), 10000);
+      setTimeout(connectWebSocket, delay);
+    } else {
+      console.error("Max reconnects.");
+    }
+  };
 }
 
 // --- Utility Functions ---
-function clearPlaceholders() { /* ... same ... */
-    const firstTradeRow = tradesTableBody.querySelector('tr'); if (firstTradeRow && firstTradeRow.cells.length === 1 && firstTradeRow.textContent.includes("Waiting")) { tradesTableBody.innerHTML = ''; }
-    KNOWN_SYMBOLS.forEach(symbol => { const asksDiv = document.getElementById(`asks-display-${symbol}`); const bidsDiv = document.getElementById(`bids-display-${symbol}`); const askPlaceholder = asksDiv?.querySelector('.book-placeholder'); const bidPlaceholder = bidsDiv?.querySelector('.book-placeholder'); if (askPlaceholder) askPlaceholder.textContent = 'Waiting...'; if (bidPlaceholder) bidPlaceholder.textContent = 'Waiting...'; });
-    const agentPlaceholder = agentListUl.querySelector('li'); if (agentPlaceholder && agentPlaceholder.textContent.includes("Loading")) { agentListUl.innerHTML = ''; }
+function clearPlaceholders() {
+  // Remove single-cell placeholder row
+  const tradePh = tradesTableBody.querySelector("tr");
+  if (tradePh && tradePh.cells.length === 1) {
+    tradesTableBody.innerHTML = "";
+  }
+  // Reset order-book placeholders
+  KNOWN_SYMBOLS.forEach(s => {
+    ["asks","bids"].forEach(side => {
+      const el = document
+        .getElementById(`${side}-display-${s}`)
+        ?.querySelector(".book-placeholder");
+      if (el) el.textContent = "Waiting...";
+    });
+  });
+  // Remove agent-loading placeholder
+  const agentPh = agentListUl.querySelector("li");
+  if (agentPh && agentPh.textContent.includes("Loading")) {
+    agentListUl.innerHTML = "";
+  }
 }
-function formatTimestamp(isoString) { /* ... same ... */ if (!isoString) return "---"; try { return new Date(isoString).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch (e) { console.error("Timestamp format error:", e); return "Invalid"; } }
-function formatCurrency(value) { /* ... same ... */ if (value === null || value === undefined) return "---"; try { return Number(value).toFixed(2); } catch { return "NaN"; } }
-function formatNumber(value) { /* ... same ... */ if (value === null || value === undefined) return "---"; try { return Number(value).toLocaleString(); } catch { return "NaN"; } }
+
+function formatTimestamp(isoString) {
+  if (!isoString) return "---";
+  try {
+    const opts = { hour: "2-digit", minute: "2-digit", second: "2-digit" };
+    return new Date(isoString).toLocaleTimeString([], opts);
+  } catch {
+    return "Invalid";
+  }
+}
+
+function formatCurrency(val) {
+  if (val == null) return "---";
+  return isNaN(val) ? "NaN" : Number(val).toFixed(2);
+}
+
+function formatNumber(val) {
+  if (val == null) return "---";
+  return isNaN(val) ? "NaN" : Number(val).toLocaleString();
+}
+
+// --- Chart Functions ---
+function initializeCharts() {
+  console.log("Initializing charts…");
+  destroyCharts();
+  KNOWN_SYMBOLS.forEach(symbol => {
+    const canvas = document.getElementById(`chart-${symbol}`);
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    priceHistory[symbol] = [];
+    priceCharts[symbol]  = new Chart(ctx, {
+      type: "line",
+      data: {
+        datasets: [{
+          label:   `${symbol} Price`,
+          data:    [],
+          borderColor: symbol === "ABC" ? "rgb(54,162,235)" : "rgb(255,99,132)",
+          borderWidth: 1.5,
+          fill: false,
+          tension: 0.1,
+          pointRadius: 0,
+          pointHoverRadius: 4
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { intersect: false, mode: "index" },
+        scales: {
+          x: { type: "linear", display: false },
+          y: { beginAtZero: false, ticks: { maxTicksLimit: 6 } }
+        },
+        plugins: {
+          legend: { display: false },
+          title:  { display: true, text: `${symbol} Price Chart` },
+          tooltip: {
+            enabled: true,
+            mode: "index",
+            intersect: false,
+            callbacks: {
+              title: (items) => {
+                const i = items[0]?.dataIndex;
+                const d = priceHistory[symbol]?.[i];
+                return d ? formatTimestamp(d.x_iso) : "";
+              },
+              label: (ctx) =>
+                ctx.parsed.y !== null
+                  ? "$" + formatCurrency(ctx.parsed.y)
+                  : ""
+            }
+          }
+        }
+      }
+    });
+    console.log(`Chart init ${symbol}`);
+  });
+}
+
+function destroyCharts() {
+  console.log("Destroying charts…");
+  Object.keys(priceCharts).forEach(symbol => {
+    priceCharts[symbol].destroy();
+    delete priceCharts[symbol];
+    delete priceHistory[symbol];
+    console.log(`Destroyed ${symbol}`);
+  });
+}
+
+function updateChart(symbol) {
+  const chart   = priceCharts[symbol];
+  const history = priceHistory[symbol];
+  if (!chart || !history) return;
+  chart.data.datasets[0].data = history.map((p,i) => ({ x: i, y: p.y }));
+  chart.update("none");
+}
 
 // --- Message Handling ---
-function handleMessage(message) { // ... same switch statement logic ...
-    if (!message || !message.type || !message.payload) { console.warn("Invalid msg format:", message); return; }
-    const payload = message.payload; const symbol = payload.symbol;
-    // console.log("Handling message:", JSON.stringify(message, null, 2));
-    switch (message.type) {
-        case "bbo_update": if (symbol) updateBboDisplay(symbol, payload); else console.warn("BBO update missing symbol:", payload); break;
-        case "trade": addTradeToTable(payload); break;
-        case "order_update": /* console.log("Order Update:", payload); */ break;
-        case "book_snapshot": if (symbol) updateOrderBookDisplay(symbol, payload); else console.warn("Book snapshot missing symbol:", payload); break;
-        case "agent_action": /* console.log("Agent Action:", payload); */ break;
-        case "agent_status": updateAgentStatus(payload); break;
-        case "exchange_stats": updateExchangeStats(payload); break;
-        default: console.warn("Received unknown message type:", message.type, payload);
-    }
+function handleMessage(msg) {
+  if (!msg?.type || !msg.payload) return;
+  const { type, payload } = msg;
+  const symbol = payload.symbol;
+  switch (type) {
+    case "bbo_update":
+      if (symbol) updateBboDisplay(symbol, payload);
+      break;
+    case "trade":
+      addTradeToTable(payload);
+      if (symbol && priceHistory[symbol] && payload.price) {
+        try {
+          const price = parseFloat(payload.price);
+          priceHistory[symbol].push({ y: price, x_iso: payload.timestamp });
+          if (priceHistory[symbol].length > MAX_CHART_POINTS) {
+            priceHistory[symbol].shift();
+          }
+          updateChart(symbol);
+        } catch(e) {
+          console.error("Chart trade err:", e);
+        }
+      }
+      break;
+    case "book_snapshot":
+      if (symbol) updateOrderBookDisplay(symbol, payload);
+      break;
+    case "agent_status":
+      updateAgentStatus(payload);
+      break;
+    case "exchange_stats":
+      updateExchangeStats(payload);
+      break;
+  }
 }
 
 // --- UI Update Functions ---
-function updateBboDisplay(symbol, bboData) { /* ... same ... */
-    const bidPriceSpan = document.getElementById(`bbo-bid-price-${symbol}`); const bidQtySpan = document.getElementById(`bbo-bid-qty-${symbol}`); const askPriceSpan = document.getElementById(`bbo-ask-price-${symbol}`); const askQtySpan = document.getElementById(`bbo-ask-qty-${symbol}`); const timestampSpan = document.getElementById(`bbo-timestamp-${symbol}`);
-    if (bidPriceSpan) bidPriceSpan.textContent = bboData.bid_price ?? "---"; if (bidQtySpan) bidQtySpan.textContent = formatNumber(bboData.bid_qty) ?? "---"; if (askPriceSpan) askPriceSpan.textContent = bboData.ask_price ?? "---"; if (askQtySpan) askQtySpan.textContent = formatNumber(bboData.ask_qty) ?? "---"; if (timestampSpan) timestampSpan.textContent = formatTimestamp(bboData.timestamp);
-}
-function addTradeToTable(tradeData) { /* ... same ... */
-    clearPlaceholders(); const row = tradesTableBody.insertRow(0); const timestamp = formatTimestamp(tradeData.timestamp);
-    row.innerHTML = `<td>${timestamp}</td><td>${tradeData.symbol}</td><td>${tradeData.price}</td><td>${formatNumber(tradeData.quantity)}</td><td>${tradeData.trade_id.substring(0, 8)}...</td>`;
-    while (tradesTableBody.rows.length > MAX_TRADES_DISPLAY) { tradesTableBody.deleteRow(tradesTableBody.rows.length - 1); }
-}
-function updateOrderBookDisplay(symbol, snapshotData) { /* ... same ... */
-    const asksDiv = document.getElementById(`asks-display-${symbol}`); const bidsDiv = document.getElementById(`bids-display-${symbol}`); if (!asksDiv || !bidsDiv) { console.warn(`Display elements not found for symbol ${symbol}`); return; } asksDiv.innerHTML = ''; bidsDiv.innerHTML = '';
-    if (snapshotData.asks.length === 0) { asksDiv.innerHTML = '<div class="book-placeholder">No asks</div>'; } else { snapshotData.asks.forEach(level => { renderBookLevel(asksDiv, level); }); }
-    if (snapshotData.bids.length === 0) { bidsDiv.innerHTML = '<div class="book-placeholder">No bids</div>'; } else { snapshotData.bids.forEach(level => { renderBookLevel(bidsDiv, level); }); }
-}
-function renderBookLevel(displayDiv, level) { /* ... same ... */
-     const levelDiv = document.createElement('div'); levelDiv.className = 'book-level'; levelDiv.innerHTML = `<span class="book-price">${level.price}</span><span class="book-qty">${formatNumber(level.quantity)}</span>`; displayDiv.appendChild(levelDiv);
+function updateBboDisplay(symbol, data) {
+  const bidP = document.getElementById(`bbo-bid-price-${symbol}`);
+  const bidQ = document.getElementById(`bbo-bid-qty-${symbol}`);
+  const askP = document.getElementById(`bbo-ask-price-${symbol}`);
+  const askQ = document.getElementById(`bbo-ask-qty-${symbol}`);
+  const ts   = document.getElementById(`bbo-timestamp-${symbol}`);
+  if (bidP) bidP.textContent = data.bid_price ?? "---";
+  if (bidQ) bidQ.textContent = formatNumber(data.bid_qty);
+  if (askP) askP.textContent = data.ask_price ?? "---";
+  if (askQ) askQ.textContent = formatNumber(data.ask_qty);
+  if (ts)   ts.textContent   = formatTimestamp(data.timestamp);
 }
 
-// Agent List/Status Updates (Includes Unrealized PnL handling)
-function populateInitialAgentList() { // ... same, uses updated AGENT_CONFIG from sim ...
-    agentListUl.innerHTML = '';
-    // This ideally should fetch config from backend, but using JS copy for now
-    const agentConfigs = { // Corresponds to INITIAL_AGENT_CONFIG in Python
-        "ABC": [{"type": "noise", "risk": 0.7, "bankroll": 10000}, {"type": "market_maker", "risk": 0.4, "bankroll": 50000}, {"type": "momentum", "risk": 1.0, "bankroll": 20000}],
-        "XYZ": [{"type": "noise", "risk": 0.8, "bankroll": 5000}, {"type": "market_maker", "risk": 0.5, "bankroll": 60000}, {"type": "momentum", "risk": 0.9, "bankroll": 15000}, {"type": "noise", "risk": 0.9, "bankroll": 8000}]
-    };
-    let agentIdCounter = 1;
-    for (const symbol in agentConfigs) {
-        agentConfigs[symbol].forEach(conf => {
-             const agentId = `Agent_${agentIdCounter}`;
-             agentState[agentId] = { agent_id: agentId, symbol: symbol, is_active: true, strategy: conf.type, risk_factor: conf.risk, bankroll: conf.bankroll, position: 0, realized_pnl: 0.0, unrealized_pnl: 0.0, trade_count: 0, average_entry_price: 0.0 };
-             addAgentToListUI(agentId, agentState[agentId]);
-             agentIdCounter++;
-        });
-    }
-    console.log("Populated initial agent list from config:", agentState);
+function addTradeToTable(trade) {
+  clearPlaceholders();
+  const row = tradesTableBody.insertRow(0);
+  const time = formatTimestamp(trade.timestamp);
+  row.innerHTML = `
+    <td>${time}</td>
+    <td>${trade.symbol}</td>
+    <td>${trade.price}</td>
+    <td>${formatNumber(trade.quantity)}</td>
+    <td>${trade.trade_id.substring(0,8)}...</td>
+  `;
+  while (tradesTableBody.rows.length > MAX_TRADES_DISPLAY) {
+    tradesTableBody.deleteRow(-1);
+  }
 }
 
-// MODIFIED: updateAgentStatus includes Unrealized PnL
-function updateAgentStatus(statusPayload) {
-    const agentId = statusPayload?.agent_id;
-    if (!agentId) { console.warn("updateAgentStatus: no agent_id"); return; }
-    console.log(`Inside updateAgentStatus for Agent ${agentId}`);
-
-    try { // Update cache
-        if (!agentState[agentId]) { agentState[agentId] = {}; console.warn(`Created cache entry for ${agentId}`); }
-        Object.assign(agentState[agentId], statusPayload); // Merge payload into cache
-        console.log(`Updated agentState[${agentId}] cache`);
-    } catch (e) { console.error(`Error updating cache for ${agentId}:`, e); return; }
-
-    const listItem = document.getElementById(`agent-${agentId}`);
-    if (!listItem) { console.warn(`List item 'agent-${agentId}' not found. Creating.`); addAgentToListUI(agentId, agentState[agentId]); return; }
-    // console.log(`Updating UI for ${agentId}.`); // Reduce log noise
-
-    try { // Update UI elements
-        const bankrollSpan = listItem.querySelector('.agent-bankroll');
-        if (bankrollSpan) bankrollSpan.textContent = formatCurrency(statusPayload.bankroll);
-        const positionSpan = listItem.querySelector('.agent-position');
-        if (positionSpan) positionSpan.textContent = formatNumber(statusPayload.position);
-        const pnlSpan = listItem.querySelector('.agent-pnl');
-        if (pnlSpan) { const pnl = statusPayload.realized_pnl ?? 0; pnlSpan.textContent = formatCurrency(pnl); pnlSpan.className = `agent-pnl ${pnl > 0 ? 'positive' : (pnl < 0 ? 'negative' : '')}`; }
-        const unrealizedPnlSpan = listItem.querySelector('.agent-unrealized-pnl'); // Find new span
-        if (unrealizedPnlSpan) { const unrealPnl = statusPayload.unrealized_pnl ?? 0; unrealizedPnlSpan.textContent = formatCurrency(unrealPnl); unrealizedPnlSpan.className = `agent-unrealized-pnl ${unrealPnl > 0 ? 'positive' : (unrealPnl < 0 ? 'negative' : '')}`; } // Update new span
-        const tradeCountSpan = listItem.querySelector('.agent-trade-count');
-        if (tradeCountSpan) tradeCountSpan.textContent = formatNumber(statusPayload.trade_count);
-        // ... (update status, strategy, risk, bankroll inputs - same as before) ...
-        if (statusPayload.is_active !== undefined) { /* ... */ }
-        if (statusPayload.strategy !== undefined) { /* ... */ }
-        if (statusPayload.risk_factor !== undefined) { const riskInput = listItem.querySelector('.agent-risk-input'); if (riskInput && document.activeElement !== riskInput) riskInput.value = Number(statusPayload.risk_factor).toFixed(1); }
-        if (statusPayload.bankroll !== undefined) { const bankrollInput = listItem.querySelector('.agent-bankroll-input'); if (bankrollInput && document.activeElement !== bankrollInput) bankrollInput.value = Math.round(statusPayload.bankroll); }
-
-    } catch (e) { console.error(`Error updating UI elements for ${agentId}:`, e); }
+function updateOrderBookDisplay(symbol, snap) {
+  const asksEl = document.getElementById(`asks-display-${symbol}`);
+  const bidsEl = document.getElementById(`bids-display-${symbol}`);
+  if (!asksEl || !bidsEl) return;
+  asksEl.innerHTML = "";
+  bidsEl.innerHTML = "";
+  if (snap.asks.length === 0) {
+    asksEl.innerHTML = '<div class="book-placeholder">No asks</div>';
+  } else {
+    snap.asks.forEach(lvl => renderBookLevel(asksEl, lvl));
+  }
+  if (snap.bids.length === 0) {
+    bidsEl.innerHTML = '<div class="book-placeholder">No bids</div>';
+  } else {
+    snap.bids.forEach(lvl => renderBookLevel(bidsEl, lvl));
+  }
 }
 
-// MODIFIED: addAgentToListUI includes Unrealized PnL span
-function addAgentToListUI(agentId, state) {
-    let listItem = document.getElementById(`agent-${agentId}`);
-    const isNew = !listItem;
-    if (isNew) { listItem = document.createElement('li'); listItem.id = `agent-${agentId}`; listItem.className = 'agent-item'; }
-
-    const cache = agentState[agentId] || {}; // Use cache as fallback
-    const isActive = state?.is_active ?? cache.is_active ?? true;
-    const currentStrategy = state?.strategy ?? cache.strategy ?? 'noise';
-    const riskFactor = state?.risk_factor ?? cache.risk_factor ?? 0.5;
-    const bankroll = state?.bankroll ?? cache.bankroll ?? 0;
-    const position = state?.position ?? cache.position ?? 0;
-    const realizedPnl = state?.realized_pnl ?? cache.realized_pnl ?? 0;
-    const unrealizedPnl = state?.unrealized_pnl ?? cache.unrealized_pnl ?? 0; // Get unrealized
-    const tradeCount = state?.trade_count ?? cache.trade_count ?? 0;
-    const symbol = state?.symbol ?? cache.symbol ?? 'N/A';
-
-    const statusClass = isActive ? 'active' : 'inactive'; const statusText = isActive ? 'Active' : 'Inactive'; const toggleButtonText = isActive ? 'Deactivate' : 'Activate';
-    const pnlClass = realizedPnl > 0 ? 'positive' : (realizedPnl < 0 ? 'negative' : '');
-    const unrealPnlClass = unrealizedPnl > 0 ? 'positive' : (unrealizedPnl < 0 ? 'negative' : ''); // Class for unrealized
-
-    let strategyOptions = ''; AVAILABLE_STRATEGIES.forEach(strat => { const selected = strat === currentStrategy ? ' selected' : ''; const displayName = strat.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()); strategyOptions += `<option value="${strat}"${selected}>${displayName}</option>`; });
-
-    listItem.innerHTML = `
-        <div class="agent-info">
-            <div class="agent-info-basic">
-                <span class="agent-id" title="${agentId}">${agentId}</span> <span class="agent-symbol">[${symbol}]</span>
-                 <select class="agent-strategy-select" data-agent-id="${agentId}" title="Select Strategy">${strategyOptions}</select>
-                <span class="agent-status ${statusClass}">${statusText}</span>
-            </div>
-            <div class="agent-info-stats">
-                <span>Bankroll: $<span class="agent-bankroll">${formatCurrency(bankroll)}</span></span>
-                <span>Pos: <span class="agent-position">${formatNumber(position)}</span></span>
-                <span>Real PnL: $<span class="agent-pnl ${pnlClass}">${formatCurrency(realizedPnl)}</span></span>
-                <span>Unreal PnL: $<span class="agent-unrealized-pnl ${unrealPnlClass}">${formatCurrency(unrealizedPnl)}</span></span> <!-- ADDED -->
-                <span>Trades: <span class="agent-trade-count">${formatNumber(tradeCount)}</span></span>
-            </div>
-        </div>
-        <div class="agent-controls">
-             <div class="control-group"> <label for="risk-${agentId}">Risk:</label> <input type="number" id="risk-${agentId}" class="agent-risk-input" step="0.1" min="0.1" max="2.0" value="${Number(riskFactor).toFixed(1)}" data-agent-id="${agentId}"> <button class="set-risk-button" data-agent-id="${agentId}">Set</button> </div>
-             <div class="control-group"> <label for="bankroll-${agentId}">Bankroll:</label> <input type="number" id="bankroll-${agentId}" class="agent-bankroll-input" step="1000" min="0" value="${Math.round(bankroll)}" data-agent-id="${agentId}"> <button class="set-bankroll-button" data-agent-id="${agentId}">Set</button> </div>
-             <div class="control-group"> <button class="toggle-button" data-agent-id="${agentId}" data-target-state="${!isActive}" title="${toggleButtonText} Agent">${toggleButtonText}</button> </div>
-        </div>`;
-
-    if (isNew) { const placeholder = agentListUl.querySelector('li'); if (placeholder && placeholder.textContent.includes("Loading")) { agentListUl.innerHTML = ''; } agentListUl.appendChild(listItem); }
-
-    const toggleButton = listItem.querySelector('.toggle-button'); const strategySelect = listItem.querySelector('.agent-strategy-select'); const setRiskButton = listItem.querySelector('.set-risk-button'); const setBankrollButton = listItem.querySelector('.set-bankroll-button');
-    toggleButton?.removeEventListener('click', handleAgentToggleButtonClick); toggleButton?.addEventListener('click', handleAgentToggleButtonClick); strategySelect?.removeEventListener('change', handleAgentStrategyChange); strategySelect?.addEventListener('change', handleAgentStrategyChange); setRiskButton?.removeEventListener('click', handleSetRiskClick); setRiskButton?.addEventListener('click', handleSetRiskClick); setBankrollButton?.removeEventListener('click', handleSetBankrollClick); setBankrollButton?.addEventListener('click', handleSetBankrollClick);
+function renderBookLevel(container, lvl) {
+  const el = document.createElement("div");
+  el.className = "book-level";
+  el.innerHTML = `
+    <span class="book-price">${lvl.price}</span>
+    <span class="book-qty">${formatNumber(lvl.quantity)}</span>
+  `;
+  container.appendChild(el);
 }
 
-// --- Event Handlers for Agent Controls ---
-function handleAgentToggleButtonClick(event) { /* ... same ... */ const button = event.target; const agentId = button.getAttribute('data-agent-id'); const targetState = button.getAttribute('data-target-state') === 'true'; if (!agentId) return; console.log(`UI Toggle: Agent=${agentId}, Target State=${targetState}`); sendControlMessage(agentId, "set_active", targetState); }
-function handleAgentStrategyChange(event) { /* ... same ... */ const select = event.target; const agentId = select.getAttribute('data-agent-id'); const newStrategy = select.value; if (!agentId) return; console.log(`UI Strategy Change: Agent=${agentId}, Strategy=${newStrategy}`); sendControlMessage(agentId, "change_strategy", newStrategy); }
-function handleSetRiskClick(event) { /* ... same ... */ const button = event.target; const agentId = button.getAttribute('data-agent-id'); const input = document.getElementById(`risk-${agentId}`); if (!agentId || !input) return; try { const newRisk = parseFloat(input.value); if (!isNaN(newRisk) && newRisk >= 0.1 && newRisk <= 2.0) { sendControlMessage(agentId, "set_risk", newRisk); if (agentState[agentId]) agentState[agentId].risk_factor = newRisk; } else { alert("Risk must be 0.1-2.0."); input.value = agentState[agentId]?.risk_factor?.toFixed(1) ?? 0.5; } } catch (e) { alert("Invalid number."); input.value = agentState[agentId]?.risk_factor?.toFixed(1) ?? 0.5; } }
-function handleSetBankrollClick(event) { /* ... same ... */ const button = event.target; const agentId = button.getAttribute('data-agent-id'); const input = document.getElementById(`bankroll-${agentId}`); if (!agentId || !input) return; try { const newBankroll = parseFloat(input.value); if (!isNaN(newBankroll) && newBankroll >= 0) { sendControlMessage(agentId, "set_bankroll", newBankroll); if (agentState[agentId]) { agentState[agentId].bankroll = newBankroll; const listItem = document.getElementById(`agent-${agentId}`); const span = listItem?.querySelector('.agent-bankroll'); if(span) span.textContent = formatCurrency(newBankroll); } } else { alert("Bankroll must be >= 0."); input.value = Math.round(agentState[agentId]?.bankroll ?? 0); } } catch (e) { alert("Invalid number."); input.value = Math.round(agentState[agentId]?.bankroll ?? 0); } }
-
-// Exchange Stats Update
-function updateExchangeStats(statsPayload) { /* ... same ... */
-     console.log("Inside updateExchangeStats", statsPayload); try { if (totalTradesSpan) { totalTradesSpan.textContent = formatNumber(statsPayload.total_trades); } else { console.error("totalTradesSpan not found!"); } if (totalValueSpan) { totalValueSpan.textContent = formatCurrency(statsPayload.total_volume_value); } else { console.error("totalValueSpan not found!"); } if (statsTimestampSpan) { statsTimestampSpan.textContent = formatTimestamp(statsPayload.timestamp); } else { console.error("statsTimestampSpan not found!"); } } catch (e) { console.error("Error updateExchangeStats:", e); }
+// --- Agent List/Status Updates ---
+function populateInitialAgentList() {
+  agentListUl.innerHTML = "";
+  const cfgs = {
+    ABC: [
+      { type:"noise", risk:0.7, bankroll:10000 },
+      { type:"market_maker", risk:0.4, bankroll:50000 },
+      { type:"momentum", risk:1.0, bankroll:20000 },
+    ],
+    XYZ: [
+      { type:"noise", risk:0.8, bankroll:5000 },
+      { type:"market_maker", risk:0.5, bankroll:60000 },
+      { type:"momentum", risk:0.9, bankroll:15000 },
+      { type:"noise", risk:0.9, bankroll:8000 },
+    ]
+  };
+  let idCnt = 1;
+  for (const sym in cfgs) {
+    cfgs[sym].forEach(cfg => {
+      const id = `Agent_${idCnt++}`;
+      agentState[id] = {
+        agent_id:      id,
+        symbol:        sym,
+        is_active:     true,
+        ...cfg,
+        position:      0,
+        realized_pnl:  0.0,
+        unrealized_pnl:0.0,
+        trade_count:   0,
+        avg_entry_price: 0.0,
+        open_orders:   []
+      };
+      addAgentToListUI(id, agentState[id]);
+    });
+  }
 }
 
-// --- Send Control Message (Agent Params) ---
-function sendControlMessage(agentId, parameter, value) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        const message = { agent_id: agentId, parameter: parameter, value: value };
-        const messageJson = JSON.stringify(message);
-        console.log("Sending agent control:", messageJson);
-        ws.send(messageJson);
-        // Optimistic UI updates (cache + key elements)
-        if (agentState[agentId]) { if (parameter === "set_active") { agentState[agentId].is_active = value; addAgentToListUI(agentId, agentState[agentId]); } else if (parameter === "change_strategy") { agentState[agentId].strategy = value; } else if (parameter === "set_risk") { agentState[agentId].risk_factor = value; } else if (parameter === "set_bankroll") { agentState[agentId].bankroll = value; const listItem = document.getElementById(`agent-${agentId}`); const bankrollSpan = listItem?.querySelector('.agent-bankroll'); if (bankrollSpan) bankrollSpan.textContent = formatCurrency(value); } }
-    } else { console.error("WS not connected."); statusDiv.textContent = "Disconnected!"; statusDiv.className = "disconnected"; }
-}
-
-// --- NEW: Send Global Command Message (Pause/Resume/Reset) ---
-function sendGlobalCommand(command) {
-     if (ws && ws.readyState === WebSocket.OPEN) {
-        const message = { command: command }; // Use 'command' key
-        const messageJson = JSON.stringify(message);
-        console.log("Sending global command:", messageJson);
-        ws.send(messageJson);
-
-        // Optimistic UI update for pause/resume
-        if(command === 'set_pause') {
-            isPaused = true;
-            updatePauseResumeButton();
-        } else if (command === 'set_resume') {
-            isPaused = false;
-            updatePauseResumeButton();
-        } else if (command === 'reset') {
-             console.log("Reset command sent. Expecting backend state update.");
-             // Optionally clear some UI elements immediately?
-             // tradesTableBody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#888;">Market Resetting...</td></tr>';
-             // No easy way to reset agent UI without full refresh or agent_status msgs
-        }
-
+// Updates an existing agent’s UI or adds it if missing
+function updateAgentStatus(payload) {
+  const id = payload.agent_id;
+  if (!id) return;
+  Object.assign(agentState[id] ||= {}, payload);
+  const li = document.getElementById(`agent-${id}`);
+  if (!li) {
+    addAgentToListUI(id, agentState[id]);
+    return;
+  }
+  // Update stats in place
+  li.querySelector(".agent-bankroll").textContent    = formatCurrency(payload.bankroll);
+  li.querySelector(".agent-position").textContent    = formatNumber(payload.position);
+  const pnlSpan   = li.querySelector(".agent-pnl");
+  const upnlSpan  = li.querySelector(".agent-unrealized-pnl");
+  const pnl       = payload.realized_pnl  ?? 0;
+  const upnl      = payload.unrealized_pnl ?? 0;
+  pnlSpan.textContent  = formatCurrency(pnl);
+  upnlSpan.textContent = formatCurrency(upnl);
+  pnlSpan.className    = `agent-pnl ${pnl>0?"positive":pnl<0?"negative":""}`;
+  upnlSpan.className   = `agent-unrealized-pnl ${upnl>0?"positive":upnl<0?"negative":""}`;
+  // Update open orders list if provided
+  if (payload.open_orders) {
+    const listEl = li.querySelector(".agent-open-orders-list");
+    const count  = li.querySelector(".open-order-count");
+    listEl.innerHTML = "";
+    if (payload.open_orders.length === 0) {
+      listEl.innerHTML = "<li>(No open orders)</li>";
+      count.textContent = "0";
     } else {
-        console.error("WebSocket is not connected. Cannot send global command.");
-        statusDiv.textContent = "Disconnected! Cannot send command.";
-        statusDiv.className = "disconnected";
+      count.textContent = payload.open_orders.length;
+      payload.open_orders.forEach(o => {
+        const elem = document.createElement("li");
+        const sideClass = o.side === "buy" ? "order-side-buy" : "order-side-sell";
+        elem.innerHTML = `
+          <span class="${sideClass}">${o.side.toUpperCase()}</span>
+          ${formatNumber(o.quantity)}
+          ${o.price?`@ ${formatCurrency(o.price)}`:"(Market)"}
+          <small>(${o.id.substring(0,6)}...)</small>
+        `;
+        listEl.appendChild(elem);
+      });
     }
+  }
 }
 
-// --- NEW: Update Pause/Resume Button Text & UI State ---
+function addAgentToListUI(id, state) {
+  let li = document.getElementById(`agent-${id}`);
+  const isNew = !li;
+  if (isNew) {
+    li = document.createElement("li");
+    li.id = `agent-${id}`;
+    li.className = "agent-item";
+  }
+  // Build strategy options
+  const stratOpts = AVAILABLE_STRATEGIES.map(s => {
+    const sel = s === (state.strategy||"noise") ? " selected" : "";
+    const name = s.replace(/_/g," ").replace(/\b\w/g,m=>m.toUpperCase());
+    return `<option value="${s}"${sel}>${name}</option>`;
+  }).join("");
+
+  li.innerHTML = `
+    <div class="agent-info">
+      <div class="agent-info-basic">
+        <span class="agent-id">${id}</span>
+        <span class="agent-symbol">[${state.symbol}]</span>
+        <select class="agent-strategy-select" data-agent-id="${id}">
+          ${stratOpts}
+        </select>
+        <span class="agent-status ${state.is_active?"active":"inactive"}">
+          ${state.is_active?"Active":"Inactive"}
+        </span>
+      </div>
+      <div class="agent-info-stats">
+        <span>Bankroll: $<span class="agent-bankroll">${formatCurrency(state.bankroll)}</span></span>
+        <span>Pos: <span class="agent-position">${formatNumber(state.position)}</span></span>
+        <span>Real PnL: $<span class="agent-pnl ${state.realized_pnl>0?"positive":state.realized_pnl<0?"negative":""}">
+          ${formatCurrency(state.realized_pnl)}
+        </span></span>
+        <span>Unreal PnL: $<span class="agent-unrealized-pnl ${state.unrealized_pnl>0?"positive":state.unrealized_pnl<0?"negative":""}">
+          ${formatCurrency(state.unrealized_pnl)}
+        </span></span>
+        <span>Trades: <span class="agent-trade-count">${formatNumber(state.trade_count)}</span></span>
+      </div>
+      <details class="agent-open-orders-details">
+        <summary>Open Orders (<span class="open-order-count">0</span>)</summary>
+        <ul class="agent-open-orders-list">
+          <li>(No open orders)</li>
+        </ul>
+      </details>
+    </div>
+    <div class="agent-controls">
+      <div class="control-group">
+        <label for="risk-${id}">Risk:</label>
+        <input type="number" id="risk-${id}" class="agent-risk-input" data-agent-id="${id}"
+               min="0.1" max="2.0" step="0.1" value="${Number(state.risk).toFixed(1)}">
+        <button class="set-risk-button" data-agent-id="${id}">Set</button>
+      </div>
+      <div class="control-group">
+        <label for="bankroll-${id}">Bankroll:</label>
+        <input type="number" id="bankroll-${id}" class="agent-bankroll-input" data-agent-id="${id}"
+               min="0" step="1000" value="${Math.round(state.bankroll)}">
+        <button class="set-bankroll-button" data-agent-id="${id}">Set</button>
+      </div>
+      <div class="control-group">
+        <button class="toggle-button" data-agent-id="${id}" data-target-state="${!state.is_active}">
+          ${state.is_active?"Deactivate":"Activate"}
+        </button>
+      </div>
+    </div>
+  `;
+
+  if (isNew) {
+    agentListUl.appendChild(li);
+  }
+
+  // Attach listeners
+  li.querySelector(".agent-strategy-select")
+    .addEventListener("change", handleAgentStrategyChange);
+  li.querySelector(".set-risk-button")
+    .addEventListener("click", handleSetRiskClick);
+  li.querySelector(".set-bankroll-button")
+    .addEventListener("click", handleSetBankrollClick);
+  li.querySelector(".toggle-button")
+    .addEventListener("click", handleAgentToggleButtonClick);
+}
+
+// --- Agent Control Handlers ---
+function handleAgentToggleButtonClick(evt) {
+  const id    = evt.target.dataset.agentId;
+  const state = evt.target.dataset.targetState === "true";
+  sendControlMessage(id, "set_active", state);
+}
+
+function handleAgentStrategyChange(evt) {
+  const id    = evt.target.dataset.agentId;
+  const strat = evt.target.value;
+  sendControlMessage(id, "change_strategy", strat);
+}
+
+function handleSetRiskClick(evt) {
+  const id  = evt.target.dataset.agentId;
+  const inp = document.getElementById(`risk-${id}`);
+  const val = parseFloat(inp.value);
+  if (!isNaN(val) && val >= 0.1 && val <= 2.0) {
+    sendControlMessage(id, "set_risk", val);
+  } else {
+    alert("Risk must be between 0.1 and 2.0");
+    inp.value = Number(agentState[id].risk).toFixed(1);
+  }
+}
+
+function handleSetBankrollClick(evt) {
+  const id  = evt.target.dataset.agentId;
+  const inp = document.getElementById(`bankroll-${id}`);
+  const val = parseFloat(inp.value);
+  if (!isNaN(val) && val >= 0) {
+    sendControlMessage(id, "set_bankroll", val);
+  } else {
+    alert("Bankroll must be ≥ 0");
+    inp.value = Math.round(agentState[id].bankroll);
+  }
+}
+
+// --- Exchange Stats Update ---
+function updateExchangeStats(payload) {
+  totalTradesSpan.textContent = formatNumber(payload.total_trades);
+  totalValueSpan.textContent  = formatCurrency(payload.total_volume_value);
+  statsTimestampSpan.textContent = formatTimestamp(payload.timestamp);
+}
+
+// --- Send Control Messages (Agents) ---
+function sendControlMessage(agentId, parameter, value) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const msg = { agent_id: agentId, parameter, value };
+    ws.send(JSON.stringify(msg));
+    console.log("Sent agent ctrl:", msg);
+  } else {
+    console.error("WS closed; cannot send agent control");
+  }
+}
+
+// --- Send Global Commands (Pause/Resume/Reset/Event) ---
+function sendGlobalCommand(command, payload=null) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const msg = { command };
+    if (payload !== null) msg.payload = payload;
+    ws.send(JSON.stringify(msg));
+    console.log("Sent global cmd:", msg);
+
+    if (command === "set_pause")   isPaused = true;
+    if (command === "set_resume")  isPaused = false;
+    if (command === "reset")       isPaused = true;
+    updatePauseResumeButton();
+  } else {
+    console.error("WS closed; cannot send global command");
+    statusDiv.textContent = "Disconnected!";
+    statusDiv.className   = "disconnected";
+  }
+}
+
+// --- Handle Market Event Trigger ---
+function handleTriggerEvent() {
+  const symbol = eventSymbolInput.value.trim().toUpperCase();
+  const pctStr = eventPercentInput.value.trim();
+  const pct    = parseFloat(pctStr);
+
+  if (!KNOWN_SYMBOLS.includes(symbol)) {
+    alert(`Symbol must be one of: ${KNOWN_SYMBOLS.join(", ")}`);
+    return;
+  }
+  if (isNaN(pct) || pct < -100 || pct > 100) {
+    alert("Shift must be between -100 and 100");
+    return;
+  }
+
+  sendGlobalCommand("market_event", {
+    symbol,
+    percent_shift: pct / 100.0
+  });
+  alert(`Sent shock for ${symbol}: ${pct}%`);
+}
+
+// --- Pause/Resume Button Update ---
 function updatePauseResumeButton() {
-    if (pauseResumeButton) {
-        pauseResumeButton.textContent = isPaused ? "Resume" : "Pause";
-    }
-    if(pausedOverlay) {
-        // Add/remove class on body for overlay visibility via CSS
-        document.body.classList.toggle('is-paused', isPaused);
-    }
+  if (pauseResumeButton) {
+    pauseResumeButton.textContent = isPaused ? "Resume" : "Pause";
+  }
+  if (pausedOverlay) {
+    document.body.classList.toggle("is-paused", isPaused);
+  }
 }
 
-// --- Event Listeners ---
-document.addEventListener('DOMContentLoaded', () => {
-    console.log("DOM loaded. Connecting WS.");
-    connectWebSocket();
+// --- Initialization on DOM Ready ---
+document.addEventListener("DOMContentLoaded", () => {
+  // Global controls
+  pauseResumeButton?.addEventListener("click", () => {
+    sendGlobalCommand(isPaused ? "set_resume" : "set_pause");
+  });
+  resetButton?.addEventListener("click", () => {
+    if (confirm("Reset market simulation? This clears order books and resets all agent states.")) {
+      sendGlobalCommand("reset");
+    }
+  });
+  triggerEventButton?.addEventListener("click", handleTriggerEvent);
 
-    // --- NEW: Add Listeners for Global Control Buttons ---
-    pauseResumeButton?.addEventListener('click', () => {
-        if (isPaused) {
-            sendGlobalCommand('set_resume');
-        } else {
-            sendGlobalCommand('set_pause');
-        }
-    });
-
-    resetButton?.addEventListener('click', () => {
-        if (confirm("Are you sure you want to reset the market simulation?\nThis will reset all agent states and clear order books.")) {
-            sendGlobalCommand('reset');
-        }
-    });
+  // Kick off WebSocket
+  connectWebSocket();
 });
