@@ -80,12 +80,10 @@ function connectWebSocket() {
 
 // --- Utility Functions ---
 function clearPlaceholders() {
-  // Remove single-cell placeholder row
   const tradePh = tradesTableBody.querySelector("tr");
   if (tradePh && tradePh.cells.length === 1) {
     tradesTableBody.innerHTML = "";
   }
-  // Reset order-book placeholders
   KNOWN_SYMBOLS.forEach(s => {
     ["asks","bids"].forEach(side => {
       const el = document
@@ -94,7 +92,6 @@ function clearPlaceholders() {
       if (el) el.textContent = "Waiting...";
     });
   });
-  // Remove agent-loading placeholder
   const agentPh = agentListUl.querySelector("li");
   if (agentPh && agentPh.textContent.includes("Loading")) {
     agentListUl.innerHTML = "";
@@ -296,15 +293,24 @@ function populateInitialAgentList() {
   agentListUl.innerHTML = "";
   const cfgs = {
     ABC: [
-      { type:"noise", risk:0.7, bankroll:10000 },
-      { type:"market_maker", risk:0.4, bankroll:50000 },
-      { type:"momentum", risk:1.0, bankroll:20000 },
+      { type:"noise", risk:1, bankroll:10000 },
+      { type:"market_maker", risk:1, bankroll:10000 },
+      { type:"momentum", risk:1.0, bankroll:10000 },
+      { type:"noise", risk:1, bankroll:10000 },
+      { type:"noise", risk:1, bankroll:10000 },
+      { type:"market_maker", risk:1, bankroll:10000 },
+      { type:"momentum", risk:1.0, bankroll:10000 },
+      { type:"noise", risk:1, bankroll:10000 },
     ],
     XYZ: [
-      { type:"noise", risk:0.8, bankroll:5000 },
-      { type:"market_maker", risk:0.5, bankroll:60000 },
-      { type:"momentum", risk:0.9, bankroll:15000 },
-      { type:"noise", risk:0.9, bankroll:8000 },
+      { type:"noise", risk:1, bankroll:10000 },
+      { type:"market_maker", risk:1, bankroll:10000 },
+      { type:"momentum", risk:1, bankroll:10000 },
+      { type:"noise", risk:1, bankroll:10000 },
+      { type:"noise", risk:1, bankroll:10000 },
+      { type:"market_maker", risk:1, bankroll:10000 },
+      { type:"momentum", risk:1, bankroll:10000 },
+      { type:"noise", risk:1, bankroll:10000 },
     ]
   };
   let idCnt = 1;
@@ -328,7 +334,6 @@ function populateInitialAgentList() {
   }
 }
 
-// Updates an existing agent’s UI or adds it if missing
 function updateAgentStatus(payload) {
   const id = payload.agent_id;
   if (!id) return;
@@ -338,7 +343,6 @@ function updateAgentStatus(payload) {
     addAgentToListUI(id, agentState[id]);
     return;
   }
-  // Update stats in place
   li.querySelector(".agent-bankroll").textContent    = formatCurrency(payload.bankroll);
   li.querySelector(".agent-position").textContent    = formatNumber(payload.position);
   const pnlSpan   = li.querySelector(".agent-pnl");
@@ -349,7 +353,6 @@ function updateAgentStatus(payload) {
   upnlSpan.textContent = formatCurrency(upnl);
   pnlSpan.className    = `agent-pnl ${pnl>0?"positive":pnl<0?"negative":""}`;
   upnlSpan.className   = `agent-unrealized-pnl ${upnl>0?"positive":upnl<0?"negative":""}`;
-  // Update open orders list if provided
   if (payload.open_orders) {
     const listEl = li.querySelector(".agent-open-orders-list");
     const count  = li.querySelector(".open-order-count");
@@ -444,7 +447,6 @@ function addAgentToListUI(id, state) {
     agentListUl.appendChild(li);
   }
 
-  // Attach listeners
   li.querySelector(".agent-strategy-select")
     .addEventListener("change", handleAgentStrategyChange);
   li.querySelector(".set-risk-button")
@@ -455,7 +457,6 @@ function addAgentToListUI(id, state) {
     .addEventListener("click", handleAgentToggleButtonClick);
 }
 
-// --- Agent Control Handlers ---
 function handleAgentToggleButtonClick(evt) {
   const id    = evt.target.dataset.agentId;
   const state = evt.target.dataset.targetState === "true";
@@ -492,14 +493,12 @@ function handleSetBankrollClick(evt) {
   }
 }
 
-// --- Exchange Stats Update ---
 function updateExchangeStats(payload) {
   totalTradesSpan.textContent = formatNumber(payload.total_trades);
   totalValueSpan.textContent  = formatCurrency(payload.total_volume_value);
   statsTimestampSpan.textContent = formatTimestamp(payload.timestamp);
 }
 
-// --- Send Control Messages (Agents) ---
 function sendControlMessage(agentId, parameter, value) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     const msg = { agent_id: agentId, parameter, value };
@@ -510,7 +509,6 @@ function sendControlMessage(agentId, parameter, value) {
   }
 }
 
-// --- Send Global Commands (Pause/Resume/Reset/Event) ---
 function sendGlobalCommand(command, payload=null) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     const msg = { command };
@@ -529,7 +527,6 @@ function sendGlobalCommand(command, payload=null) {
   }
 }
 
-// --- Handle Market Event Trigger ---
 function handleTriggerEvent() {
   const symbol = eventSymbolInput.value.trim().toUpperCase();
   const pctStr = eventPercentInput.value.trim();
@@ -551,7 +548,6 @@ function handleTriggerEvent() {
   alert(`Sent shock for ${symbol}: ${pct}%`);
 }
 
-// --- Pause/Resume Button Update ---
 function updatePauseResumeButton() {
   if (pauseResumeButton) {
     pauseResumeButton.textContent = isPaused ? "Resume" : "Pause";
@@ -561,9 +557,7 @@ function updatePauseResumeButton() {
   }
 }
 
-// --- Initialization on DOM Ready ---
 document.addEventListener("DOMContentLoaded", () => {
-  // Global controls
   pauseResumeButton?.addEventListener("click", () => {
     sendGlobalCommand(isPaused ? "set_resume" : "set_pause");
   });
@@ -574,6 +568,5 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   triggerEventButton?.addEventListener("click", handleTriggerEvent);
 
-  // Kick off WebSocket
   connectWebSocket();
 });

@@ -4,10 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Flashbook Dashboard</title>
-    <!-- Chart.js CDN -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
-        /* --- Basic Layout & Theme --- */
         body { font-family: sans-serif; margin: 15px; background-color: #f8f9fa; color: #333; font-size: 14px; }
         h1 { text-align: center; color: #0056b3; margin-bottom: 20px; }
         h3, h4, h5 { color: #004085; margin-bottom: 10px; }
@@ -119,11 +117,9 @@
     <h1>Flashbook Real-Time Dashboard</h1>
     <div id="status" class="connecting">Connecting...</div>
 
-    <!-- Global Controls Section -->
     <section class="global-controls">
         <button id="pause-resume-button">Pause</button>
         <button id="reset-button">Reset Market</button>
-        <!-- Market Event Controls - Now Populated -->
         <div id="market-event-controls">
              <label for="event-symbol">Symbol:</label>
              <input type="text" id="event-symbol" value="ABC" list="symbol-list">
@@ -139,16 +135,13 @@
         </div>
     </section>
 
-    <!-- Exchange Stats Section -->
     <section class="exchange-stats">
         Total Trades: <span id="total-trades">0</span> |
         Total Value Traded: $<span id="total-value">0.00</span> |
         Last Update: <span id="stats-timestamp">---</span>
     </section>
 
-    <!-- Market Data Sections -->
     <section class="market-data-container">
-        <!-- Section for ABC Symbol -->
         <div class="market-symbol-section" id="market-ABC">
              <h3>ABC Market</h3>
              <div class="bbo-section">
@@ -163,7 +156,6 @@
              </div>
              <div class="chart-container"><canvas id="chart-ABC"></canvas></div>
         </div>
-        <!-- Section for XYZ Symbol -->
         <div class="market-symbol-section" id="market-XYZ">
              <h3>XYZ Market</h3>
              <div class="bbo-section">
