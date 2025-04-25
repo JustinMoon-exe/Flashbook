@@ -17,8 +17,8 @@ def quantize_price(price: Decimal | None) -> Decimal | None:
     if price is None:
         return None
     try:
-        # Ensure price is not negative and quantize
+        
         quantized_price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         return max(Decimal("0.01"), quantized_price)
     except (InvalidOperation, TypeError):
-        return None # Return None if quantization fails
+        return None 

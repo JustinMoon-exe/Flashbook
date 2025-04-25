@@ -1,16 +1,12 @@
-# python_services/app/models.py
-from pydantic import BaseModel, Field, model_validator, ConfigDict # Import ConfigDict for Pydantic v2 style
+from pydantic import BaseModel, Field, model_validator, ConfigDict
 from typing import Literal, Optional
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal  # Import Python's built-in Decimal
+from decimal import Decimal
 
 class Order(BaseModel):
-    # Use ConfigDict for Pydantic v2 configuration style
     model_config = ConfigDict(
-        json_encoders={
-            Decimal: str  # Serialize Decimal fields as strings in JSON output
-        },
+        json_encoders={Decimal: str},
         populate_by_name=True,
         from_attributes=True,
     )
@@ -18,7 +14,6 @@ class Order(BaseModel):
     order_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     symbol: str
     side: Literal['buy', 'sell']
-    # Use Python's Decimal type for price, ensuring precision
     price: Decimal = Field(gt=Decimal(0), description="Order price (must be positive)")
     quantity: int = Field(gt=0, description="Order quantity (must be positive)")
     timestamp: datetime = Field(
@@ -29,38 +24,28 @@ class Order(BaseModel):
         default='new',
         description="Current status of the order"
     )
-    # Making remaining_quantity non-optional for clarity, initialize on creation
     remaining_quantity: int = Field(
-        default=0, # Will be set by validator below
+        default=0,
         ge=0,
         description="Quantity remaining to be filled"
     )
 
-    # Pydantic v2 validator to initialize remaining_quantity based on quantity
     @model_validator(mode='after')
     def set_remaining_quantity(self) -> 'Order':
-        # This runs after initial field validation
         if self.remaining_quantity == 0 and self.quantity > 0:
-             # Only set if it hasn't been set by direct input (though usually shouldn't be)
-             self.remaining_quantity = self.quantity
+            self.remaining_quantity = self.quantity
         elif self.remaining_quantity > self.quantity:
-             # Basic sanity check
-             raise ValueError("remaining_quantity cannot be greater than quantity")
+            raise ValueError("remaining_quantity cannot be greater than quantity")
         return self
 
-
 class MarketData(BaseModel):
-    # Use ConfigDict for Pydantic v2 configuration style
     model_config = ConfigDict(
-        json_encoders={
-            Decimal: str  # Serialize Decimal fields as strings in JSON output
-        },
+        json_encoders={Decimal: str},
         populate_by_name=True,
         from_attributes=True,
     )
 
     symbol: str
-    # Use Python's Decimal type for market data consistency
     bid: Optional[Decimal] = Field(default=None, description="Highest bid price")
     ask: Optional[Decimal] = Field(default=None, description="Lowest ask price")
     last: Optional[Decimal] = Field(default=None, description="Price of the last trade")

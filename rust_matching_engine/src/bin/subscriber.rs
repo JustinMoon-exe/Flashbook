@@ -1,197 +1,226 @@
-// rust_matching_engine/src/bin/subscriber.rs
-
 use tokio::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::env; // For getting environment variables like REDIS_URL
-// Remove unused import: use std::time::Duration;
+use std::env;
+use serde::Deserialize;
 
-// Import items from our library crate
-// Note: Some imports might still show as unused depending on exact usage below
 use rust_matching_engine::{
-    Order, OrderBook, Trade, OrderStatus, BboUpdate, OrderBookSnapshot, PriceLevelInfo
+    Order, OrderBook, OrderStatus, BboUpdate, OrderBookSnapshot
 };
 
-// Import necessary external crates and traits
 use futures_util::stream::StreamExt;
+use redis::aio::ConnectionLike;
 use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
 
-// Redis channel names
 const ORDER_SUBMIT_CHANNEL: &str = "orders:new";
+const ENGINE_CONTROL_CHANNEL: &str = "engine:control";
+const MARKET_EVENTS_CHANNEL: &str = "market:events";
 const TRADE_EXECUTION_CHANNEL: &str = "trades:executed";
 const ORDER_UPDATE_CHANNEL: &str = "orders:updated";
 const BBO_UPDATE_CHANNEL_PREFIX: &str = "marketdata:bbo:";
 const BOOK_SNAPSHOT_CHANNEL_PREFIX: &str = "marketdata:book:";
-const SNAPSHOT_DEPTH: usize = 5; // Order book depth for snapshots
+const SNAPSHOT_DEPTH: usize = 5;
 
-// Type alias for shared order books map
 type OrderBookMap = Arc<Mutex<HashMap<String, OrderBook>>>;
+
+#[derive(Deserialize, Debug)]
+struct EngineControlCommand { command: String }
+
+#[derive(Deserialize, Debug)]
+struct MarketEventPayload { symbol: String, percent_shift: f64 }
 
 #[tokio::main]
 async fn main() -> redis::RedisResult<()> {
-    // Setup logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("Starting Rust Matching Engine Subscriber...");
 
-    // --- Redis Connection Setup ---
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     log::info!("Connecting to Redis at: {}", redis_url);
-    let redis_client = match redis::Client::open(redis_url) {
-        Ok(client) => client,
-        Err(e) => { log::error!("Failed to open Redis client: {}", e); return Err(e); }
-    };
+    let redis_client = redis::Client::open(redis_url)?;
 
-    let publish_conn: MultiplexedConnection = match redis_client.get_multiplexed_async_connection().await {
-         Ok(conn) => conn,
-         Err(e) => { log::error!("Failed to get multiplexed Redis connection for publishing: {}", e); return Err(e); }
-    };
+    let publish_conn: MultiplexedConnection = redis_client.get_multiplexed_async_connection().await?;
     log::info!("Established multiplexed Redis connection for publishing.");
 
-    let mut pubsub_conn = match redis_client.get_async_connection().await {
-         Ok(conn) => conn.into_pubsub(),
-         Err(e) => { log::error!("Failed to get Redis connection for PubSub: {}", e); return Err(e); }
-    };
-    log::info!("Established Redis connection for PubSub.");
-    // --- End Redis Connection Setup ---
+    let mut sub_conn = redis_client.get_async_connection().await?;
+    log::info!("Established dedicated Redis connection for subscribing.");
+    let mut pubsub = sub_conn.into_pubsub();
 
-    // Shared state for order books
+    pubsub.subscribe(ORDER_SUBMIT_CHANNEL).await?;
+    log::info!("Subscribed to: {}", ORDER_SUBMIT_CHANNEL);
+    pubsub.subscribe(ENGINE_CONTROL_CHANNEL).await?;
+    log::info!("Subscribed to: {}", ENGINE_CONTROL_CHANNEL);
+    pubsub.subscribe(MARKET_EVENTS_CHANNEL).await?;
+    log::info!("Subscribed to: {}", MARKET_EVENTS_CHANNEL);
+
     let order_books: OrderBookMap = Arc::new(Mutex::new(HashMap::new()));
+    let mut msg_stream = pubsub.on_message();
 
-    // Subscribe to the new order channel
-    match pubsub_conn.subscribe(ORDER_SUBMIT_CHANNEL).await {
-        Ok(_) => log::info!("Subscribed to Redis channel: {}", ORDER_SUBMIT_CHANNEL),
-        Err(e) => { log::error!("Failed to subscribe to {}: {}", ORDER_SUBMIT_CHANNEL, e); return Err(e); }
+    log::info!("Entering main message processing loop...");
+    while let Some(msg) = msg_stream.next().await {
+        let channel_name = msg.get_channel_name();
+        let payload: String = match msg.get_payload() {
+            Ok(p) => p,
+            Err(e) => { log::error!("Failed to get payload: {}", e); continue; }
+        };
+        log::debug!("Received msg on '{}': {}", channel_name, payload);
+
+        if channel_name == ENGINE_CONTROL_CHANNEL {
+            match serde_json::from_str::<EngineControlCommand>(&payload) {
+                Ok(cmd) => {
+                    log::info!("Received Engine Control: {:?}", cmd);
+                    if cmd.command == "reset_engine" {
+                        log::warn!(">>> ENGINE RESET initiated <<<");
+                        let mut books = order_books.lock().await;
+                        books.clear();
+                        log::info!("Cleared all books.");
+                    } else {
+                        log::warn!("Unknown engine command: {}", cmd.command);
+                    }
+                }
+                Err(e) => log::error!("Failed parse engine control: {}. Payload: {}", e, payload),
+            }
+            continue;
+        }
+
+        if channel_name == MARKET_EVENTS_CHANNEL {
+            match serde_json::from_str::<MarketEventPayload>(&payload) {
+                Ok(event_data) => {
+                    log::warn!(
+                        ">>> MARKET EVENT: Symbol={}, Shift={:.2}% <<<",
+                        event_data.symbol,
+                        event_data.percent_shift * 100.0
+                    );
+                    let mut books_guard = order_books.lock().await;
+                    if let Some(book) = books_guard.get_mut(&event_data.symbol) {
+                        log::info!("Applying market event (clearing book): {}", event_data.symbol);
+                        book.clear_book();
+
+                        let symbol_clone = event_data.symbol;
+                        let mut publish_conn_clone = publish_conn.clone();
+                        drop(books_guard);
+
+                        tokio::spawn(async move {
+                            let cleared_bbo = BboUpdate::new(symbol_clone.clone(), None, None, None, None);
+                            if let Ok(bbo_json) = serde_json::to_string(&cleared_bbo) {
+                                let chan = format!("{}{}", BBO_UPDATE_CHANNEL_PREFIX, symbol_clone);
+                                let _ = publish_conn_clone
+                                    .publish(&chan, &bbo_json)
+                                    .await
+                                    .map_err(|e| log::error!("FAIL Pub CLEARED BBO {}: {}", symbol_clone, e));
+                                log::info!("Pub CLEARED BBO for {}", symbol_clone);
+                            }
+                            let cleared_snapshot = OrderBookSnapshot::new(symbol_clone.clone(), vec![], vec![]);
+                            if let Ok(snap_json) = serde_json::to_string(&cleared_snapshot) {
+                                let chan = format!("{}{}", BOOK_SNAPSHOT_CHANNEL_PREFIX, symbol_clone);
+                                let _ = publish_conn_clone
+                                    .publish::<_, _, ()>(&chan, &snap_json)
+                                    .await
+                                    .map_err(|e| log::error!("FAIL Pub CLEARED Snap {}: {}", symbol_clone, e));
+                                log::info!("Pub CLEARED Snapshot for {}", symbol_clone);
+                            }
+                        });
+                    } else {
+                        log::warn!("Market event for unknown symbol: {}", event_data.symbol);
+                    }
+                }
+                Err(e) => log::error!("Failed parse market event: {}. Payload: {}", e, payload),
+            }
+            continue;
+        }
+
+        if channel_name == ORDER_SUBMIT_CHANNEL {
+            let order_result = serde_json::from_str::<Order>(&payload);
+            let order: Order = match order_result {
+                Ok(mut o) => { o.ensure_remaining_quantity(); o },
+                Err(e) => {
+                    log::error!("Failed deserialize order: {}. Payload: {}", e, payload);
+                    continue;
+                }
+            };
+            log::info!("Deserialized order ID: {}", order.id);
+
+            let books_clone = Arc::clone(&order_books);
+            let order_id_for_task = order.id;
+            let symbol_for_task = order.symbol.clone();
+            let mut publish_conn_clone = publish_conn.clone();
+
+            tokio::spawn(async move {
+                let mut books_guard = books_clone.lock().await;
+                let book = books_guard
+                    .entry(symbol_for_task.clone())
+                    .or_insert_with(|| OrderBook::new(symbol_for_task));
+
+                let (final_status, trades) = book.add_order(order);
+                log::info!(
+                    "Order {} processed. Status: {:?}, Trades: {}",
+                    order_id_for_task,
+                    final_status,
+                    trades.len()
+                );
+
+                let (bid_p, bid_q, ask_p, ask_q) = book.get_bbo_with_qty();
+                let current_bbo = BboUpdate::new(book.symbol().to_string(), bid_p, bid_q, ask_p, ask_q);
+                let bbo_changed = book.last_bbo().as_ref() != Some(&current_bbo);
+                if bbo_changed {
+                    *book.last_bbo_mut() = Some(current_bbo.clone());
+                    if let Ok(json) = serde_json::to_string(&current_bbo) {
+                        let ch = format!("{}{}", BBO_UPDATE_CHANNEL_PREFIX, current_bbo.symbol);
+                        let _ = publish_conn_clone
+                            .publish(&ch, &json)
+                            .await
+                            .map_err(|e| log::error!("FAIL Pub BBO {}: {}", current_bbo.symbol, e));
+                    }
+                }
+
+                let current_snapshot = book.get_snapshot(SNAPSHOT_DEPTH);
+                let snapshot_changed = book.last_snapshot().as_ref() != Some(&current_snapshot);
+                if snapshot_changed {
+                    *book.last_snapshot_mut() = Some(current_snapshot.clone());
+                    if let Ok(json) = serde_json::to_string(&current_snapshot) {
+                        let ch = format!("{}{}", BOOK_SNAPSHOT_CHANNEL_PREFIX, current_snapshot.symbol);
+                        let _ = publish_conn_clone
+                            .publish(&ch, &json)
+                            .await
+                            .map_err(|e| log::error!("FAIL Pub Snap {}: {}", current_snapshot.symbol, e));
+                    }
+                }
+
+                for trade in trades {
+                    log::info!(
+                        "Pub Trade - Maker: {}, Taker: {}",
+                        trade.maker_order_id,
+                        trade.taker_order_id
+                    );
+                    if let Ok(json) = serde_json::to_string(&trade) {
+                        let _ = publish_conn_clone
+                            .publish(TRADE_EXECUTION_CHANNEL, &json)
+                            .await
+                            .map_err(|e| log::error!("FAIL Pub Trade {}: {}", trade.trade_id, e));
+                    }
+                }
+
+                let update_payload = serde_json::json!({
+                    "id": order_id_for_task,
+                    "status": final_status,
+                    "remaining_quantity": if final_status == OrderStatus::Filled {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                });
+                if let Ok(json) = serde_json::to_string(&update_payload) {
+                    let _ = publish_conn_clone
+                        .publish(ORDER_UPDATE_CHANNEL, &json)
+                        .await
+                        .map_err(|e| log::error!("FAIL Pub OrderUp {}: {}", order_id_for_task, e));
+                }
+            });
+        } else {
+            log::warn!("Msg on unhandled channel: {}", channel_name);
+        }
     }
 
-    // Get a stream of messages
-    let mut msg_stream = pubsub_conn.on_message();
-
-    // --- Main Message Processing Loop ---
-    while let Some(msg) = msg_stream.next().await {
-        let payload: String = match msg.get_payload() {
-             Ok(p) => p,
-             Err(e) => { log::error!("Failed to get payload from Redis message: {}", e); continue; }
-        };
-        log::debug!("Received message payload: {}", payload);
-
-        let order: Order = match serde_json::from_str(&payload) {
-            Ok(o) => o,
-            Err(e) => { log::error!("Failed to deserialize order JSON: {}. Payload: {}", e, payload); continue; }
-        };
-        log::info!("Deserialized order: {}", order.id);
-
-        // Spawn a task for processing
-        let books_clone = Arc::clone(&order_books);
-        let order_clone = order.clone();
-        let mut publish_conn_clone = publish_conn.clone();
-
-        tokio::spawn(async move {
-            let symbol = order_clone.symbol.clone();
-            let mut books_guard = books_clone.lock().await; // Lock mutex
-
-            let book = books_guard.entry(symbol.clone())
-                        .or_insert_with(|| { log::info!("Creating new order book for symbol: {}", symbol); OrderBook::new(symbol) });
-
-            // --- Process the Order ---
-            let (final_status, trades) = book.add_order(order_clone.clone());
-            log::info!("Order {} processed. Status: {:?}, Trades Generated: {}", order_clone.id, final_status, trades.len());
-
-            // --- Check and Publish BBO Update ---
-            let (bid_price, bid_qty, ask_price, ask_qty) = book.get_bbo_with_qty();
-            let current_bbo = BboUpdate::new(book.symbol().to_string(), bid_price, bid_qty, ask_price, ask_qty);
-
-            let bbo_changed = match book.last_bbo() {
-                Some(last) => last.bid_price != current_bbo.bid_price || last.bid_qty != current_bbo.bid_qty || last.ask_price != current_bbo.ask_price || last.ask_qty != current_bbo.ask_qty,
-                None => current_bbo.bid_price.is_some() || current_bbo.ask_price.is_some(),
-            };
-
-            if bbo_changed {
-                log::info!("BBO changed for {}: Bid={:?}({:?}), Ask={:?}({:?})",
-                         current_bbo.symbol, current_bbo.bid_price.map(|p| p.to_string()), current_bbo.bid_qty,
-                         current_bbo.ask_price.map(|p| p.to_string()), current_bbo.ask_qty);
-                *book.last_bbo_mut() = Some(current_bbo.clone()); // Update last known BBO
-
-                match serde_json::to_string(&current_bbo) { // Pass by reference
-                     Ok(bbo_json) => {
-                         let channel = format!("{}{}", BBO_UPDATE_CHANNEL_PREFIX, current_bbo.symbol);
-                         log::debug!("Publishing BBO update to {}: {}", channel, bbo_json);
-                         let res: Result<usize, redis::RedisError> = publish_conn_clone.publish(&channel, &bbo_json).await;
-                         match res {
-                             Ok(count) => log::info!("Published BBO update for {} to {} ({} subscribers)", current_bbo.symbol, channel, count),
-                             Err(e) => log::error!("Failed to publish BBO update for {} to Redis: {}", current_bbo.symbol, e),
-                         }
-                     }
-                     Err(e) => { log::error!("Failed to serialize BBO update {:?}: {}", current_bbo.symbol, e); }
-                }
-            } else {
-                log::debug!("BBO unchanged for {}", book.symbol());
-            }
-
-            // --- Check and Publish Order Book Snapshot ---
-            let current_snapshot = book.get_snapshot(SNAPSHOT_DEPTH);
-
-            // Compare with last published snapshot
-            let snapshot_changed = match book.last_snapshot() {
-                 // Use '*' to dereference 'last' before comparing with 'current_snapshot'
-                 Some(last) => *last != current_snapshot, // <-- CORRECTED COMPARISON
-                 None => !current_snapshot.bids.is_empty() || !current_snapshot.asks.is_empty(),
-            };
-
-            if snapshot_changed {
-                log::info!("Snapshot changed for {}", current_snapshot.symbol);
-                 *book.last_snapshot_mut() = Some(current_snapshot.clone()); // Update last known snapshot
-
-                 match serde_json::to_string(&current_snapshot) { // Pass by reference
-                     Ok(snapshot_json) => {
-                         let channel = format!("{}{}", BOOK_SNAPSHOT_CHANNEL_PREFIX, current_snapshot.symbol);
-                         log::debug!("Publishing snapshot update to {}: {}...", channel, &snapshot_json[..std::cmp::min(snapshot_json.len(), 150)]);
-                         let res: Result<usize, redis::RedisError> = publish_conn_clone.publish(&channel, &snapshot_json).await;
-                         match res {
-                             Ok(count) => log::info!("Published snapshot update for {} to {} ({} subscribers)", current_snapshot.symbol, channel, count),
-                             Err(e) => log::error!("Failed to publish snapshot update for {} to Redis: {}", current_snapshot.symbol, e),
-                         }
-                     }
-                     Err(e) => { log::error!("Failed to serialize snapshot update {:?}: {}", current_snapshot.symbol, e); }
-                 }
-            } else {
-                log::debug!("Snapshot unchanged for {}", book.symbol());
-            }
-
-            // --- Publish Trade Results ---
-            for trade in trades {
-                match serde_json::to_string(&trade) {
-                    Ok(trade_json) => {
-                        log::debug!("Publishing trade: {}", trade_json);
-                        let res: Result<usize, redis::RedisError> = publish_conn_clone.publish(TRADE_EXECUTION_CHANNEL, &trade_json).await;
-                        match res {
-                             Ok(count) => log::info!("Published trade {} to {} ({} subscribers)", trade.trade_id, TRADE_EXECUTION_CHANNEL, count),
-                             Err(e) => log::error!("Failed to publish trade {} to Redis: {}", trade.trade_id, e),
-                        }
-                    }
-                    Err(e) => { log::error!("Failed to serialize trade {:?}: {}", trade.trade_id, e); }
-                }
-            }
-
-            // --- Publish Order Update for Taker Order ---
-            let mut updated_order = order_clone;
-            updated_order.status = final_status;
-
-            match serde_json::to_string(&updated_order) {
-                 Ok(order_update_json) => {
-                     log::debug!("Publishing order update: {}", order_update_json);
-                     let res: Result<usize, redis::RedisError> = publish_conn_clone.publish(ORDER_UPDATE_CHANNEL, &order_update_json).await;
-                     match res {
-                          Ok(count) => log::info!("Published order update {} to {} ({} subscribers)", updated_order.id, ORDER_UPDATE_CHANNEL, count),
-                          Err(e) => log::error!("Failed to publish order update {} to Redis: {}", updated_order.id, e),
-                     }
-                 }
-                 Err(e) => { log::error!("Failed to serialize order update {:?}: {}", updated_order.id, e); }
-            }
-
-        }); // End of tokio::spawn
-    } // End while loop
-
-    log::warn!("Redis message stream ended. Subscriber shutting down.");
+    log::warn!("Redis stream ended. Subscriber shutting down.");
     Ok(())
-} // End main
+}
